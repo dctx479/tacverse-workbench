@@ -30,10 +30,10 @@ DEFAULTS = {
         # and mixed-case (e.g. Open-cup-lid); the last segment must be 4 digits.
         "regex": r"^TacVerse/taccap-g1-[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*-\d{4}$",
     },
-    "avg_duration": {"min_sec": 20, "max_sec": 200},
+    "avg_duration": {"min_sec": 20, "max_sec": 600},
     "prompt": {
         "min_words": 10,
-        "max_words": 30,
+        "max_words": 50,
         # Characters that should not appear inside a prompt sentence.
         "illegal_chars": [
             "_", "-",
