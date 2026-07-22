@@ -2015,6 +2015,15 @@ class MainWindow(QWidget):
 
     def _refresh_baseline_hint(self):
         """Spell out the Hugging Face commit-diff basis for dashboard highlights."""
+        if not self._has_hf_change_rows():
+            base = dd.find_baseline(self.report, self.history) if self.report else None
+            if base:
+                self.baseline_hint.setText(
+                    f"暂无 HF commit 变更历史缓存；当前临时显示相较于 {fmt_day(base.get('date'))} 的本地快照增量。执行「仅拉取统计信息」后切换为真实 HF 提交差分。")
+            else:
+                self.baseline_hint.setText(
+                    "暂无 HF commit 变更历史缓存；执行「仅拉取统计信息」后可按真实提交差分统计今日新增。")
+            return
         totals = dd.hf_change_totals(self.hf_changes)
         if not totals.get("date"):
             self.baseline_hint.setText(
@@ -2047,7 +2056,18 @@ class MainWindow(QWidget):
         self.kpi_labels["completion"].setText(pct)
 
     def _hf_update_totals(self):
+        if not self._has_hf_change_rows():
+            deltas = self._current_deltas()
+            hours, episodes = self._new_totals(deltas)
+            datasets = sum(1 for delta in deltas.values()
+                           if (delta.get("d_hours", 0) or 0) > 0
+                           or (delta.get("d_episodes", 0) or 0) > 0)
+            return {"date": (self.report or {}).get("date", ""),
+                    "hours": hours, "episodes": episodes, "datasets": datasets}
         return dd.hf_change_totals(self.hf_changes)
+
+    def _has_hf_change_rows(self):
+        return bool(dd.hf_change_rows(self.hf_changes))
 
     def _new_totals(self, deltas):
         """(new_hours, new_episodes) since the baseline day.
@@ -2069,16 +2089,34 @@ class MainWindow(QWidget):
 
     def _refresh_mvp(self, date):
         """MVP by HF update day: top uploader among datasets updated that day."""
-        rows = dd.hf_change_group_totals(
-            self.hf_changes, lambda row: uploader_cn(row.get("uploader")), date)
-        top = rows[0] if rows else None
+        if self._has_hf_change_rows():
+            rows = dd.hf_change_group_totals(
+                self.hf_changes, lambda row: uploader_cn(row.get("uploader")), date)
+            top = rows[0] if rows else None
+            if not top or top["hours"] <= 0:
+                self.mvp_name_lbl.setText("—")
+                self.mvp_sub_lbl.setText("今日暂无新增贡献")
+                return
+            self.mvp_name_lbl.setText(top["group"])
+            self.mvp_sub_lbl.setText(
+                f"{fmt_day(top['date'])} · {top['hours']} 小时 · {fmt_value(top['episodes'])} episodes")
+            return
+        deltas = self._current_deltas()
+        by_person = {}
+        for dataset in (self.report.get("datasets", []) if self.report else []):
+            delta = deltas.get(dataset.get("dataset_name"), {})
+            group = by_person.setdefault(uploader_cn(dataset.get("uploader")),
+                                         {"hours": 0.0, "episodes": 0})
+            group["hours"] += max(0, delta.get("d_hours", 0) or 0)
+            group["episodes"] += max(0, delta.get("d_episodes", 0) or 0)
+        name, top = max(by_person.items(), key=lambda item: item[1]["hours"], default=("—", None))
         if not top or top["hours"] <= 0:
             self.mvp_name_lbl.setText("—")
             self.mvp_sub_lbl.setText("今日暂无新增贡献")
             return
-        self.mvp_name_lbl.setText(top["group"])
+        self.mvp_name_lbl.setText(name)
         self.mvp_sub_lbl.setText(
-            f"{fmt_day(top['date'])} · {top['hours']} 小时 · {fmt_value(top['episodes'])} episodes")
+            f"本地快照 · {round(top['hours'], 2)} 小时 · {fmt_value(top['episodes'])} episodes")
 
     def _downloaded_leaves(self):
         """Leaf names of datasets whose raw files are downloaded under pulls/.
@@ -2549,10 +2587,14 @@ class MainWindow(QWidget):
         self.daily_group_table.setSortingEnabled(False)
         self.daily_group_table.setRowCount(len(rows))
         if not rows:
-            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的 HF commit 每日新增数据。")
+            self.daily_group_hint.setText(f"暂无可归因到「{dim}」的每日新增数据。")
         else:
-            self.daily_group_hint.setText(
-                f"按 HF commit 中 meta/info.json 的真实增量，统计每个「{dim}」分组每日新增小时。")
+            if self._has_hf_change_rows():
+                self.daily_group_hint.setText(
+                    f"按 HF commit 中 meta/info.json 的真实增量，统计每个「{dim}」分组每日新增小时。")
+            else:
+                self.daily_group_hint.setText(
+                    f"暂无 HF commit 缓存；当前临时显示每个「{dim}」分组的本地快照增量。")
         for i, row in enumerate(rows):
             values = [
                 fmt_day(row.get("date")),
@@ -2575,7 +2617,9 @@ class MainWindow(QWidget):
         self.rollup_plot.clear()
         dim = self.dim_combo.currentText()
         key_fn = ROLLUP_DIMS[dim]
-        daily_rows = dd.hf_change_daily_group_series(self.hf_changes, key_fn)
+        daily_rows = (dd.hf_change_daily_group_series(self.hf_changes, key_fn)
+                      if self._has_hf_change_rows()
+                      else dd.daily_group_series(self.history, key_fn))
         self._refresh_daily_group_table(daily_rows, dim)
         if not self.report:
             return
