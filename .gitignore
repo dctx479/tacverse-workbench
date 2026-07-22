@@ -3,6 +3,7 @@
 # root file ./dataset_log.json instead, so a clone gets history without datasets/.
 datasets/
 pulls/
+hf_change_history.local.json
 
 # Python virtual env / caches
 .venv/
