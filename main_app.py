@@ -559,7 +559,9 @@ class MainWindow(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        top = QHBoxLayout()
+        toolbar = QWidget()
+        top = QHBoxLayout(toolbar)
+        top.setContentsMargins(0, 0, 0, 0)
         if LOGO_PATH.is_file():
             logo = QLabel()
             logo.setPixmap(QPixmap(str(LOGO_PATH)).scaledToHeight(
@@ -670,7 +672,14 @@ class MainWindow(QWidget):
         self.clock_timer.timeout.connect(self._tick_clock)
         self.clock_timer.start(1000)
         self._tick_clock()
-        root.addLayout(top)
+        toolbar_scroll = QScrollArea()
+        toolbar_scroll.setFrameShape(QFrame.NoFrame)
+        toolbar_scroll.setWidgetResizable(False)
+        toolbar_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        toolbar_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        toolbar_scroll.setMaximumHeight(toolbar.sizeHint().height() + 18)
+        toolbar_scroll.setWidget(toolbar)
+        root.addWidget(toolbar_scroll)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard_tab(), "看板")
@@ -973,16 +982,48 @@ class MainWindow(QWidget):
         v = QVBoxLayout(w)
         self.trend_hint = QLabel("")
         v.addWidget(self.trend_hint)
+
+        split = QSplitter(Qt.Vertical)
+
+        charts = QWidget()
+        charts_v = QVBoxLayout(charts)
+        charts_v.setContentsMargins(0, 0, 0, 0)
         self.daily_plot = pg.PlotWidget(title="每日新增小时数")
         self.daily_plot.showGrid(x=False, y=True, alpha=0.3)
-        v.addWidget(self.daily_plot)
+        charts_v.addWidget(self.daily_plot)
         self.cum_plot = pg.PlotWidget(title="累计小时数")
         self.cum_plot.showGrid(x=False, y=True, alpha=0.3)
-        v.addWidget(self.cum_plot)
+        charts_v.addWidget(self.cum_plot)
         # X labels are two lines ("07-03\n周五"); give the bottom axis enough
         # height so the weekday line isn't clipped.
         for pltw in (self.daily_plot, self.cum_plot):
             pltw.getAxis("bottom").setHeight(46)
+        split.addWidget(charts)
+
+        daily_user_box = QGroupBox("单用户单日新增上传总时长")
+        daily_user_v = QVBoxLayout(daily_user_box)
+        self.daily_user_hint = QLabel("按每日最后一次快照对比上一天，统计每位上传者的新增小时。")
+        self.daily_user_hint.setStyleSheet("color:#888; font-size:12px;")
+        daily_user_v.addWidget(self.daily_user_hint)
+        self.daily_user_table = QTableWidget(0, 6)
+        self.daily_user_table.setHorizontalHeaderLabels(
+            ["日期", "HF ID", "上传者", "新增小时", "新增episodes", "数据集数"])
+        self.daily_user_table.setSortingEnabled(True)
+        self.daily_user_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.daily_user_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.daily_user_table.verticalHeader().setVisible(False)
+        daily_hdr = self.daily_user_table.horizontalHeader()
+        daily_hdr.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        daily_hdr.setSectionResizeMode(1, QHeaderView.ResizeToContents)
+        daily_hdr.setSectionResizeMode(2, QHeaderView.Stretch)
+        for col in range(3, 6):
+            daily_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        daily_user_v.addWidget(self.daily_user_table, 1)
+        split.addWidget(daily_user_box)
+        split.setStretchFactor(0, 3)
+        split.setStretchFactor(1, 2)
+        split.setSizes([720, 360])
+        v.addWidget(split, 1)
         return w
 
     def _build_rollup_tab(self):
@@ -2277,6 +2318,8 @@ class MainWindow(QWidget):
 
     def _refresh_trends(self):
         series = dd.daily_series(self.history)
+        user_rows = dd.daily_uploader_series(self.history)
+        self._refresh_daily_user_table(user_rows)
         self.daily_plot.clear()
         self.cum_plot.clear()
         if not series:
@@ -2300,6 +2343,32 @@ class MainWindow(QWidget):
                            symbolBrush="#34A853")
         self.cum_plot.getAxis("bottom").setTicks(ticks)
         self.cum_plot.setXRange(-0.5, len(series) - 0.5, padding=0.02)
+
+    def _refresh_daily_user_table(self, rows):
+        self.daily_user_table.setSortingEnabled(False)
+        self.daily_user_table.setRowCount(len(rows))
+        if not rows:
+            self.daily_user_hint.setText("暂无可归因到上传者的单日新增数据。")
+        else:
+            self.daily_user_hint.setText(
+                "按每日最后一次快照对比上一天，统计每位上传者的新增小时。")
+        for i, row in enumerate(rows):
+            values = [
+                fmt_day(row.get("date")),
+                row.get("uploader") or "—",
+                uploader_cn(row.get("uploader")),
+                row.get("hours", 0),
+                row.get("episodes", 0),
+                row.get("datasets", 0),
+            ]
+            for j, value in enumerate(values):
+                if j >= 3:
+                    item = NumericItem(fmt_value(value), value)
+                else:
+                    item = QTableWidgetItem(str(value))
+                self.daily_user_table.setItem(i, j, item)
+        self.daily_user_table.setSortingEnabled(True)
+        self.daily_user_table.sortItems(0, Qt.DescendingOrder)
 
     def _refresh_rollup(self):
         self.rollup_table.setRowCount(0)

@@ -426,7 +426,7 @@ def load_history(out_dir, history_file=HISTORY_FILE, config_file=CONFIG_FILE):
             r = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        by_at.setdefault(r.get("pulled_at") or str(f), r)  # config wins on ties
+        by_at.setdefault(r.get("pulled_at") or str(f), r)  # history file wins on ties
     history = list(by_at.values())
     history.sort(key=lambda r: r.get("pulled_at", ""))
     return history
@@ -460,6 +460,56 @@ def daily_series(history):
             "total_datasets": r.get("total_datasets", 0) or 0,
         })
     return series
+
+
+def daily_uploader_series(history):
+    """Per-uploader daily positive growth from the last snapshot of each day.
+
+    Returns rows sorted by date oldest-first and hours descending within each day:
+    {date, uploader, hours, episodes, datasets}. The first detailed day counts
+    each dataset's full duration as that day's contribution. If the previous day
+    has only aggregate totals and no dataset details, attribution for the next
+    day is skipped because per-user growth cannot be derived safely.
+    """
+    by_day = {}
+    for r in history:
+        by_day[r.get("date", "")] = r
+    rows = []
+    prev_report = None
+    prev = {}
+    for date in sorted(k for k in by_day if k):
+        report = by_day[date]
+        datasets = report.get("datasets", []) or []
+        aggregate_only_prior = bool(prev_report) and not prev
+        if not aggregate_only_prior:
+            groups = {}
+            for dataset in datasets:
+                name = dataset.get("dataset_name")
+                if not name:
+                    continue
+                prior = prev.get(name)
+                d_hours = round((dataset.get("duration_hours") or 0)
+                                - (prior.get("duration_hours") or 0 if prior else 0), 3)
+                d_episodes = (dataset.get("total_episodes") or 0) \
+                    - (prior.get("total_episodes") or 0 if prior else 0)
+                hours = max(0, d_hours)
+                episodes = max(0, d_episodes)
+                if hours <= 0 and episodes <= 0:
+                    continue
+                uploader = dataset.get("uploader") or ""
+                group = groups.setdefault(
+                    uploader, {"date": date, "uploader": uploader, "hours": 0.0,
+                               "episodes": 0, "datasets": 0})
+                group["hours"] += hours
+                group["episodes"] += episodes
+                group["datasets"] += 1
+            day_rows = sorted(groups.values(), key=lambda g: g["hours"], reverse=True)
+            for row in day_rows:
+                row["hours"] = round(row["hours"], 3)
+            rows.extend(day_rows)
+        prev_report = report
+        prev = {d.get("dataset_name"): d for d in datasets if d.get("dataset_name")}
+    return rows
 
 
 def find_baseline(current_report, history):
