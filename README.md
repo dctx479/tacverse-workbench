@@ -17,7 +17,7 @@
 - **团队看板 GUI**（PySide6），页签：
   - **看板**：KPI 卡片（数据集总数 / 总小时 / 总 episodes / 今日新增小时 / 今日新增 episodes / 目标完成度 / **今日 MVP ⭐**）+ 可排序筛选的数据集表格（含 **均时长(s)** 质量指标、robot_type、任务数、HF ID、上传者中文名、最后更新、今日新增）。表格默认按 HF「最近更新」排序，和网页一致。
   - **趋势**：每日新增小时（柱，仅显示实际拉取过的日期，不留空白）+ 累计小时（折线）。
-  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并基于 Hugging Face commit history 展示当前维度下的单组单日新增总时长。
+  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并以 Hugging Face `last_modified` 归日、优先使用 commit history 差分、缺失时用本地快照兜底展示单组单日新增总时长。
   - **数据集编辑**：左侧是与看板一致的数据集详情表（选中要操作的数据集）；右侧两组功能——① **改名 / 改 Prompt**（本地 pyarrow 生成新副本，可推送回 Hub）；② 调用 lerobot 官方 `dataset_tools` 的 **删除 episodes / 拆分 / 合并 / 增加特征 / 删除特征**。详见下方[「数据集编辑」](#数据集编辑生成新副本不改动原数据)。
   - **Viewer**：内嵌 `xense_lerobot_viewer`（Next.js），3D 回放 / 语言标注 / 标签编辑；Viewer 数据根固定为 `datasets/<组织名>/`，可直接发现该组织目录下的全部本地数据集。
   - **Episode 时长定位**：选中已下载的数据集后，检查面板中的 `STATISTICS` 会按时长区间列出 episode 数量；展开区间即可查看具体 `ep`、实际秒数和 frames，用于快速定位过短或过长的数据。
@@ -237,7 +237,7 @@ Doctor 由 `third_party/lerobot_viewer` 提供，Workbench 通过 viewer 的 HTT
   - 顶部“手动补录统计”可写入指定日期的四项累计总量。同一组织和日期再次录入会覆盖旧的手动值；同日后续真实统计会替代手动快照。
   - 手动快照不包含逐数据集信息，因此作为最新记录时不会显示数据集表格、分组统计或 MVP；“今日新增”由它与前一个有记录日期的累计值相减得到。
 - **`hf_change_history.local.json`**（本地 HF 变更缓存，已被 git 忽略）：
-  - 程序缓存 Hugging Face commit history 中 `meta/info.json` 的差分，作为今日新增、MVP 和单组单日新增的数据源。
+  - 程序以 Hugging Face `last_modified` 归日，优先使用 commit history 中 `meta/info.json` 的差分计算今日新增、MVP 和单组单日新增；缺失时使用本地快照兜底。
   - 该缓存只保存在本机，不提交到仓库。
 - **`datasets/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积；组织目录下不再按日期分层。
 
