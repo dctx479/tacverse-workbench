@@ -771,6 +771,35 @@ def load_history(out_dir, log_file=DATASET_LOG_FILE):
     return history
 
 
+def load_latest_local_report(out_dir, org=ORG):
+    """Return the newest locally available report without network access.
+
+    Priority: explicit pull_result JSON, then the committed dataset log, then a
+    best-effort scan of downloaded <dataset>/meta/info.json directories.
+    """
+    latest = find_latest_report(out_dir)
+    if latest:
+        data = _load_json(latest)
+        if isinstance(data, dict) and data.get("datasets"):
+            return data, str(latest)
+
+    history = load_history(out_dir)
+    if history:
+        report = history[-1]
+        if isinstance(report, dict) and report.get("datasets"):
+            return report, DATASET_LOG_FILE
+
+    summaries = []
+    for info in sorted(Path(out_dir).glob("*/meta/info.json")):
+        dataset_dir = info.parent.parent
+        summaries.append(build_summary(f"{org}/{dataset_dir.name}", str(dataset_dir)))
+    if summaries:
+        latest_time = max((Path(s["local_dir"]).stat().st_mtime for s in summaries), default=None)
+        now = dt.datetime.fromtimestamp(latest_time) if latest_time else dt.datetime.now()
+        return build_report(summaries, [], now, org, len(summaries)), str(Path(out_dir))
+    return None, None
+
+
 def migrate_pull_history_to_log(config_path=CONFIG_FILE, log_path=DATASET_LOG_FILE):
     """One-time: convert config['pull_history'] into dataset_log.json, then drop
     the pull_history key from config (keeping checks + uploader_names). Rebuilds
