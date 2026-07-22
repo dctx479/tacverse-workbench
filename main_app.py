@@ -906,10 +906,10 @@ class MainWindow(QWidget):
     KPI_CARDS = [
         ("total_datasets", "数据集总数", False),
         ("total_episodes", "总 episodes", False),
-        ("new_episodes", "今日新增episodes", False),
+        ("new_episodes", "HF更新日episodes", False),
         ("total_frames", "总 frames", False),
         ("total_hours", "总小时数", True),
-        ("new_hours", "今日新增小时", False),
+        ("new_hours", "HF更新日小时", False),
         ("completion", "目标完成度", False),
     ]
 
@@ -1163,7 +1163,7 @@ class MainWindow(QWidget):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         cv = QVBoxLayout(card)
-        t = QLabel("今日 MVP ⭐")
+        t = QLabel("HF 更新 MVP ⭐")
         t.setStyleSheet("color: #666; font-size: 12px;")
         self.mvp_name_lbl = QLabel("—")
         self.mvp_name_lbl.setStyleSheet(
@@ -2009,17 +2009,14 @@ class MainWindow(QWidget):
         return dd.compute_deltas(self.report, self.history)
 
     def _refresh_baseline_hint(self):
-        """Spell out which earlier pull the「今日新增」figures are compared against."""
-        base = dd.find_baseline(self.report, self.history) if self.report else None
-        if not base:
-            self.baseline_hint.setText(
-                "「今日新增」暂无历史基准 —— 这是首次拉取，下方增量即为全部总量。")
+        """Spell out the Hugging Face update-day basis for dashboard highlights."""
+        datasets = (self.report or {}).get("datasets", [])
+        date = dd.hf_latest_update_date(datasets)
+        if not date:
+            self.baseline_hint.setText("「今日新增」暂无 HF last_modified 数据，无法按 Hugging Face 更新日统计。")
             return
-        day = fmt_day(base.get("date"))
-        gap = days_between(base.get("date"), (self.report or {}).get("date"))
-        ago = f"（{gap} 天前）" if gap else ""
         self.baseline_hint.setText(
-            f"「今日新增」= 相较于 {day}{ago} 最近一次拉取结果的增量。")
+            f"「HF更新日小时 / MVP」= HF last_modified 属于 {fmt_day(date)} 的数据集总量。")
 
     def _refresh_kpis(self):
         r = self.report
@@ -2031,9 +2028,9 @@ class MainWindow(QWidget):
             self.mvp_sub_lbl.setText("")
             return
         self._refresh_baseline_hint()
-        deltas = self._current_deltas()
-        self._refresh_mvp(deltas)
-        new_hours, new_eps = self._new_totals(deltas)
+        hf_totals = self._hf_update_totals()
+        self._refresh_mvp(hf_totals["date"])
+        new_hours, new_eps = hf_totals["hours"], hf_totals["episodes"]
         target = self.target_spin.value()
         pct = f"{round(100 * new_hours / target)}%" if target else "—"
         self.kpi_labels["total_datasets"].setText(fmt_value(r.get("total_datasets")))
@@ -2043,6 +2040,10 @@ class MainWindow(QWidget):
         self.kpi_labels["new_hours"].setText(f"+{new_hours}")
         self.kpi_labels["new_episodes"].setText(f"+{fmt_value(new_eps)}")
         self.kpi_labels["completion"].setText(pct)
+
+    def _hf_update_totals(self):
+        datasets = (self.report or {}).get("datasets", [])
+        return dd.hf_update_totals(datasets)
 
     def _new_totals(self, deltas):
         """(new_hours, new_episodes) since the baseline day.
@@ -2062,28 +2063,19 @@ class MainWindow(QWidget):
         ne = sum(d["d_episodes"] for d in deltas.values())
         return nh, ne
 
-    def _refresh_mvp(self, deltas):
-        """Today's MVP = the person whose datasets added the most new hours today.
-
-        Attributes each dataset's 今日新增 (delta) to its uploader's Chinese name,
-        then picks the top by hours. Shows their hours + episodes underneath.
-        """
-        by_person = {}
-        for d in (self.report.get("datasets", []) if self.report else []):
-            dv = deltas.get(d["dataset_name"], {})
-            agg = by_person.setdefault(uploader_cn(d.get("uploader")),
-                                       {"hours": 0.0, "eps": 0})
-            agg["hours"] += dv.get("d_hours", 0) or 0
-            agg["eps"] += dv.get("d_episodes", 0) or 0
-        top = max(by_person.items(), key=lambda kv: kv[1]["hours"], default=None)
-        if not top or top[1]["hours"] <= 0:
+    def _refresh_mvp(self, date):
+        """MVP by HF update day: top uploader among datasets updated that day."""
+        datasets = (self.report or {}).get("datasets", [])
+        rows = dd.hf_update_group_totals(
+            datasets, lambda dataset: uploader_cn(dataset.get("uploader")), date)
+        top = rows[0] if rows else None
+        if not top or top["hours"] <= 0:
             self.mvp_name_lbl.setText("—")
-            self.mvp_sub_lbl.setText("今日暂无新增贡献")
+            self.mvp_sub_lbl.setText("暂无 HF 当日更新贡献")
             return
-        name, agg = top
-        self.mvp_name_lbl.setText(name)
+        self.mvp_name_lbl.setText(top["group"])
         self.mvp_sub_lbl.setText(
-            f"{round(agg['hours'], 2)} 小时 · {fmt_value(agg['eps'])} episodes")
+            f"{fmt_day(top['date'])} · {top['hours']} 小时 · {fmt_value(top['episodes'])} episodes")
 
     def _downloaded_leaves(self):
         """Leaf names of datasets whose raw files are downloaded under pulls/.

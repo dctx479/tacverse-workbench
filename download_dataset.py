@@ -588,6 +588,54 @@ def hf_daily_group_series(datasets, key_fn):
     return rows
 
 
+def hf_latest_update_date(datasets):
+    """Newest Hugging Face last_modified date (YYMMDD) in current datasets."""
+    dates = [_hf_update_date(dataset) for dataset in datasets or []]
+    return max((date for date in dates if date), default="")
+
+
+def hf_update_totals(datasets, date=None):
+    """Totals for datasets whose Hugging Face update day equals `date`.
+
+    If date is omitted, uses the newest HF update day in the dataset list.
+    """
+    date = date or hf_latest_update_date(datasets)
+    totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
+    if not date:
+        return totals
+    for dataset in datasets or []:
+        if _hf_update_date(dataset) != date:
+            continue
+        totals["hours"] += dataset.get("duration_hours") or 0
+        totals["episodes"] += dataset.get("total_episodes") or 0
+        totals["datasets"] += 1
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
+def hf_update_group_totals(datasets, key_fn, date=None):
+    """Group totals for one Hugging Face update day."""
+    date = date or hf_latest_update_date(datasets)
+    groups = {}
+    if not date:
+        return []
+    for dataset in datasets or []:
+        if _hf_update_date(dataset) != date:
+            continue
+        key = key_fn(dataset) or "—"
+        group = groups.setdefault(
+            key, {"date": date, "group": key, "hours": 0.0,
+                  "episodes": 0, "datasets": 0})
+        group["hours"] += dataset.get("duration_hours") or 0
+        group["episodes"] += dataset.get("total_episodes") or 0
+        group["datasets"] += 1
+    rows = list(groups.values())
+    for row in rows:
+        row["hours"] = round(row["hours"], 2)
+    rows.sort(key=lambda row: row["hours"], reverse=True)
+    return rows
+
+
 def find_baseline(current_report, history):
     """Return the snapshot to diff `current_report` against: the last pull of the
     most recent *earlier day*.
