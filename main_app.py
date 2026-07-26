@@ -3441,6 +3441,24 @@ class MainWindow(QWidget):
             w.wait(2000)
         for w in list(self._report_workers):
             w.wait(2000)
+        # Same for the one-shot workers (pull/stats/download/edit/push/op) and
+        # especially the deep quality scan, which can run for minutes: ask it
+        # to cancel, give it a moment, then terminate as a last resort —
+        # otherwise Qt aborts with "QThread: Destroyed while thread is still
+        # running" when the window closes mid-scan.
+        qw = getattr(self, "quality_worker", None)
+        if qw is not None and qw.isRunning():
+            qw.cancel()
+            if not qw.wait(8000):
+                qw.terminate()
+                qw.wait(2000)
+        for name in ("worker", "dl_worker", "_edit_worker", "_push_worker",
+                     "_op_worker"):
+            w = getattr(self, name, None)
+            if w is not None and hasattr(w, "wait") and w.isRunning():
+                if not w.wait(5000):
+                    w.terminate()
+                    w.wait(2000)
         super().closeEvent(event)
 
     # ---- Button handlers -------------------------------------------------- #
