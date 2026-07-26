@@ -38,7 +38,7 @@
       "boundary_abs_threshold": 0.2,
       "jump_mad_factor": 14.0,
       "jump_abs_threshold": 0.35,
-      "flicker_sample_step": 1,
+      "flicker_sample_step": 3,
       "flicker_luma_threshold": 45.0,
       "flicker_recover_ratio": 0.45,
       "max_video_frames": 12000,
@@ -48,7 +48,7 @@
       "remote_enabled": true,
       "remote_cache_dir": ".quality_cache",
       "report_dir": ".quality_reports",
-      "remote_max_episodes": 0,
+      "remote_max_episodes": 8,
       "max_issues": 80
     }
   },
