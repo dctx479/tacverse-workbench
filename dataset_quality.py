@@ -44,6 +44,11 @@ VECTOR_COLUMNS = (
     "action",
 )
 
+# Tactile gel cameras: a static, low-texture image is their NORMAL state (no
+# contact = no change), so freeze/blur heuristics built for wrist views would
+# fire constantly on them.
+TACTILE_FIELDS = tuple(f for f in STREAM_FIELDS if "tactile" in f)
+
 DEFAULT_CFG = {
     "start_end_window": 10,
     "boundary_mad_factor": 6.0,
@@ -600,6 +605,19 @@ def _ffmpeg_exe():
         return None
 
 
+def _is_h264(path):
+    try:
+        import cv2
+        import struct
+        cap = cv2.VideoCapture(str(path))
+        fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+        cap.release()
+        codec = struct.pack("<I", fourcc).decode(errors="replace").lower()
+        return codec in ("h264", "avc1")
+    except Exception:
+        return True  # can't probe -> don't churn the file
+
+
 def _transcode_h264(path):
     """Re-encode a clip to H.264/yuv420p in place so browsers can play it.
 
@@ -637,6 +655,10 @@ def _write_clip(src, dst, start_sec, end_sec, *, episode_start_sec=None, camera_
         return None
     src, dst = Path(src), Path(dst)
     if dst.is_file():
+        # Clips cached by an older run may still be browser-unplayable mp4v;
+        # upgrade them in place instead of serving them forever.
+        if not _is_h264(dst):
+            _transcode_h264(dst)
         return dst
     cap = cv2.VideoCapture(str(src))
     if not cap.isOpened():
@@ -801,6 +823,7 @@ def _check_flicker(root, cfg, progress=None, cancel=None):
         pct = 60 + int(15 * (vid_no - 1) / total) if total else 60
         _emit(progress, f"检查视频闪烁/模糊/曝光/冻结 {vid_no}/{total}: {path.name}", pct)
         ep = _episode_from_name(path)
+        is_tactile = field in TACTILE_FIELDS
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             issues.append(Issue("warn", "video_read", f"{field}: 视频无法打开", ep, field=field, path=str(path)))
@@ -857,8 +880,9 @@ def _check_flicker(root, cfg, progress=None, cancel=None):
             # Absolute Laplacian thresholds don't transfer between cameras, so
             # sharpness is collected here (well-exposed frames only, to avoid
             # double-reporting dark scenes) and judged against the video's own
-            # median after decoding.
-            if low_luma <= mean <= high_luma:
+            # median after decoding. Tactile gel views are inherently smooth
+            # and motionless — blur/freeze do not apply to them.
+            if not is_tactile and low_luma <= mean <= high_luma:
                 sharp_series.append(
                     (frame_idx, float(cv2.Laplacian(gray, cv2.CV_64F).var())))
 
@@ -872,7 +896,8 @@ def _check_flicker(root, cfg, progress=None, cancel=None):
                     _video_issue("exposure", f"{field} 画面持续过曝(平均亮度 {mean:.0f} > {high_luma:g})", frame_idx)
 
             # -- frozen stream (encoder/driver stall repeats frames) -----------
-            if prev_gray is not None and "camera_freeze" not in reported:
+            # Skipped for tactile cameras: no contact = no change is normal.
+            if not is_tactile and prev_gray is not None and "camera_freeze" not in reported:
                 frame_delta = float(cv2.absdiff(gray, prev_gray).mean())
                 runs["freeze"] = runs["freeze"] + 1 if frame_delta < freeze_diff else 0
                 if runs["freeze"] >= freeze_need:
@@ -1200,7 +1225,9 @@ def write_report(dataset, issues, cfg=None):
                 )
                 shutil.copy2(src, ep_dir / clip_name)
                 clip_names.append(clip_name)
-                clip_links[camera] = str(Path(ep_dir.name) / clip_name)
+                # Forward slashes: this relative path lands in <video src>,
+                # where a Windows backslash breaks some browsers' URL parsing.
+                clip_links[camera] = f"{ep_dir.name}/{clip_name}"
             rec = _issue_record(issue, clip_links)
             rec["issue_id"] = issue_id
             ep_records.append(rec)
