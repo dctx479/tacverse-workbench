@@ -587,6 +587,49 @@ def _video_fps(path):
     return float(fps) if fps and fps > 0 else None
 
 
+@lru_cache(maxsize=1)
+def _ffmpeg_exe():
+    """An H.264-capable ffmpeg: PATH first, then imageio-ffmpeg's bundled one."""
+    exe = shutil.which("ffmpeg")
+    if exe:
+        return exe
+    try:
+        import imageio_ffmpeg
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        return None
+
+
+def _transcode_h264(path):
+    """Re-encode a clip to H.264/yuv420p in place so browsers can play it.
+
+    OpenCV's VideoWriter only has MPEG-4 Part 2 ("mp4v") available in this
+    env, which HTML5 <video> cannot decode — the report showed every clip as
+    0:00. Best effort: without ffmpeg the mp4v file is kept (still playable
+    in desktop players)."""
+    exe = _ffmpeg_exe()
+    if not exe:
+        return
+    import subprocess
+    path = Path(path)
+    tmp = path.with_suffix(".h264.mp4")
+    cmd = [exe, "-y", "-v", "error", "-i", str(path),
+           "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+           "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(tmp)]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=180)
+        if r.returncode == 0 and tmp.is_file() and tmp.stat().st_size > 0:
+            path.unlink()
+            tmp.rename(path)
+        else:
+            tmp.unlink(missing_ok=True)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
 def _write_clip(src, dst, start_sec, end_sec, *, episode_start_sec=None, camera_name=None):
     try:
         import cv2
@@ -638,7 +681,10 @@ def _write_clip(src, dst, start_sec, end_sec, *, episode_start_sec=None, camera_
         cur += 1
     writer.release()
     cap.release()
-    return dst if dst.is_file() else None
+    if not dst.is_file():
+        return None
+    _transcode_h264(dst)
+    return dst
 
 
 def _clip_targets(issue, fields):
