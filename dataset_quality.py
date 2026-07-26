@@ -54,9 +54,25 @@ DEFAULT_CFG = {
     "flicker_luma_threshold": 45.0,
     "flicker_recover_ratio": 0.45,
     "max_video_frames": 12000,
+    # UMI-style handheld capture degrades in known ways (see UMI/TacUMI and
+    # score_lerobot_episodes): motion blur from fast motion, bad exposure in
+    # dim/backlit scenes, frozen camera streams, padded idle trajectories and
+    # outlier episode lengths. Thresholds below gate those checks.
+    "blur_laplacian_threshold": 45.0,   # absolute floor: below = blurry
+    "blur_rel_ratio": 0.12,             # ...or below this share of the video's
+                                        # own median sharpness (camera-agnostic)
+    "blur_min_sec": 0.8,                # sustained this long before flagging
+    "exposure_low_luma": 25.0,          # mean gray below = 欠曝
+    "exposure_high_luma": 230.0,        # mean gray above = 过曝
+    "exposure_min_sec": 0.8,
+    "freeze_diff_threshold": 0.4,       # mean abs frame diff below = frozen
+    "freeze_min_sec": 1.0,
+    "idle_epsilon": 0.004,              # per-frame state L2 delta ~ standstill
+    "idle_max_sec": 5.0,                # longest tolerated standstill
+    "length_iqr_factor": 2.5,           # Tukey fence for episode durations
     "clip_margin_sec": 1.0,
-    "clip_lead_sec": 2.0,
-    "clip_max_sec": 8.0,
+    "clip_lead_sec": 4.0,
+    "clip_max_sec": 10.0,
     "remote_enabled": True,
     "remote_cache_dir": ".quality_cache",
     "report_dir": ".quality_reports",
@@ -399,6 +415,72 @@ def _check_jumps(episodes, cfg, fps):
     return issues
 
 
+def _check_idle(episodes, cfg, fps):
+    """Flag long standstills inside an episode (padded/hesitant trajectories).
+
+    score_lerobot_episodes calls these "idle periods and inflated
+    trajectories" — dead time that adds training cost without signal."""
+    issues = []
+    epsilon = float(cfg["idle_epsilon"])
+    max_idle = float(cfg["idle_max_sec"])
+    for ep, rec in episodes.items():
+        cols = rec.get("columns", {})
+        col = next((c for c in VECTOR_COLUMNS if cols.get(c)), None)
+        if not col:
+            continue
+        seq = sorted(cols[col], key=lambda x: x[0])
+        run_start = None
+        worst = None  # (length_sec, start_frame, end_frame)
+        for (prev_frame, prev), (frame, cur) in zip(seq, seq[1:]):
+            dist = _l2(_finite_vec(prev), _finite_vec(cur))
+            if dist is not None and dist < epsilon:
+                if run_start is None:
+                    run_start = prev_frame
+                length = (frame - run_start) / fps
+                if worst is None or length > worst[0]:
+                    worst = (length, run_start, frame)
+            else:
+                run_start = None
+        if worst and worst[0] > max_idle:
+            length, f0, f1 = worst
+            issues.append(_issue(
+                "idle_period",
+                f"{col} 连续静止 {length:.1f}s (> {max_idle:g}s)，疑似长时间停顿/注水轨迹",
+                episode_index=ep, frame_index=f0, field=col, fps=fps,
+                start_sec=f0 / fps, end_sec=f1 / fps))
+    return issues
+
+
+def _check_episode_length(episodes, cfg, fps):
+    """Flag episodes whose duration falls outside the Tukey IQR fence of the
+    dataset — usually aborted takes that should have been deleted, or runaway
+    recordings."""
+    durations = {}
+    for ep, rec in episodes.items():
+        frames = sorted(rec.get("frames") or [])
+        if frames:
+            durations[ep] = (frames[-1] - frames[0] + 1) / fps
+    if len(durations) < 5:
+        return []
+    values = sorted(durations.values())
+    q1 = values[int(0.25 * (len(values) - 1))]
+    q3 = values[int(0.75 * (len(values) - 1))]
+    iqr = max(q3 - q1, 1e-9)
+    factor = float(cfg["length_iqr_factor"])
+    lo, hi = q1 - factor * iqr, q3 + factor * iqr
+    med = _median(values)
+    issues = []
+    for ep, sec in sorted(durations.items(), key=lambda x: x[1]):
+        if sec < lo or sec > hi:
+            kind = "偏短" if sec < lo else "偏长"
+            issues.append(_issue(
+                "episode_length",
+                f"episode 时长 {sec:.1f}s 明显{kind}(数据集中位 {med:.1f}s)，疑似失败重录未删或超时录制",
+                episode_index=ep, frame_index=0, fps=fps,
+                start_sec=0.0, end_sec=min(sec, float(cfg["clip_max_sec"]))))
+    return issues
+
+
 def _video_paths(root):
     paths = []
     for field in STREAM_FIELDS:
@@ -560,7 +642,9 @@ def _write_clip(src, dst, start_sec, end_sec, *, episode_start_sec=None, camera_
 
 
 def _clip_targets(issue, fields):
-    if issue.rule in ("camera_flicker", "jpeg_log_error") and issue.field in fields:
+    per_stream_rules = ("camera_flicker", "jpeg_log_error", "motion_blur",
+                        "exposure", "camera_freeze")
+    if issue.rule in per_stream_rules and issue.field in fields:
         chosen = issue.field if issue.field in fields else None
         return [chosen] if chosen else []
     wrists = [field for field in ("left_wrist", "right_wrist") if field in fields]
@@ -600,12 +684,19 @@ def _attach_clips(root, issues, cfg, default_fps, progress=None, cancel=None):
             issue.end_sec = _round_time(center + margin)
         if issue.end_sec <= issue.start_sec:
             issue.end_sec = _round_time(issue.start_sec + 1.0)
+        # The issue window [start_sec, end_sec] must survive intact; the lead
+        # is expendable context. So when the total exceeds clip_max_sec, shrink
+        # the lead first instead of trimming the tail (the old behaviour cut
+        # the event itself off end-of-episode clips).
         lead = float(cfg.get("clip_lead_sec", 0.0) or 0.0)
-        clip_start = _round_time(max(0.0, issue.start_sec - lead))
-        clip_end = issue.end_sec
         max_len = float(cfg["clip_max_sec"])
-        if clip_end - clip_start > max_len:
-            clip_end = _round_time(clip_start + max_len)
+        clip_end = issue.end_sec
+        window = clip_end - issue.start_sec
+        if window > max_len:
+            clip_end = _round_time(issue.start_sec + max_len)
+            window = max_len
+        lead = min(lead, max_len - window)
+        clip_start = _round_time(max(0.0, issue.start_sec - lead))
         for video_field in targets:
             video_info = fields.get(video_field)
             if isinstance(video_info, dict):
@@ -648,25 +739,48 @@ def _check_flicker(root, cfg, progress=None, cancel=None):
     luma_threshold = float(cfg["flicker_luma_threshold"])
     recover_ratio = float(cfg["flicker_recover_ratio"])
     max_frames = int(cfg["max_video_frames"])
+    blur_threshold = float(cfg["blur_laplacian_threshold"])
+    low_luma = float(cfg["exposure_low_luma"])
+    high_luma = float(cfg["exposure_high_luma"])
+    freeze_diff = float(cfg["freeze_diff_threshold"])
+    margin = float(cfg["clip_margin_sec"])
     videos = _video_paths(root)
     total = len(videos)
     for vid_no, (field, path) in enumerate(videos, 1):
         _check_cancel(cancel)
         # This is by far the longest stage (full decode of every stream), so
         # report per-video progress across the 60-75% band instead of sitting
-        # silently at 60%.
+        # silently at 60%. Blur/exposure/freeze checks piggyback on the same
+        # decode pass, so they cost no extra decoding.
         pct = 60 + int(15 * (vid_no - 1) / total) if total else 60
-        _emit(progress, f"检查视频闪烁 {vid_no}/{total}: {path.name}", pct)
+        _emit(progress, f"检查视频闪烁/模糊/曝光/冻结 {vid_no}/{total}: {path.name}", pct)
         ep = _episode_from_name(path)
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
             issues.append(Issue("warn", "video_read", f"{field}: 视频无法打开", ep, field=field, path=str(path)))
             continue
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        # sustained-run lengths in samples (durations are configured in secs)
+        need = lambda key: max(3, int(float(cfg[key]) * fps / step))
+        blur_need, expo_need, freeze_need = (
+            need("blur_min_sec"), need("exposure_min_sec"), need("freeze_min_sec"))
         prev = None
         prev_diff = None
+        prev_gray = None
+        runs = {"dark": 0, "bright": 0, "freeze": 0}
+        sharp_series = []  # (frame_idx, laplacian_var) on well-exposed frames
+        reported = set()  # at most one issue per rule per video
         frame_idx = -1
         sampled = 0
+
+        def _video_issue(rule, message, at_frame):
+            center = at_frame / fps
+            issues.append(_issue(
+                rule, message, episode_index=ep, frame_index=at_frame,
+                field=field, path=path, fps=fps,
+                start_sec=max(0.0, center - margin), end_sec=center + margin))
+            reported.add(rule)
+
         while sampled < max_frames:
             ok, frame = cap.read()
             if not ok:
@@ -680,25 +794,64 @@ def _check_flicker(root, cfg, progress=None, cancel=None):
                 raise QualityCancelled("检查已取消")
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean = float(gray.mean())
+
+            # -- flicker (single-frame luma spike that recovers) --------------
             if prev is not None:
                 diff = abs(mean - prev)
                 if prev_diff is not None and prev_diff > luma_threshold and diff > luma_threshold * recover_ratio:
-                    frame = frame_idx - step
-                    center = frame / fps
-                    margin = float(cfg["clip_margin_sec"])
-                    issues.append(_issue(
-                        "camera_flicker",
-                        f"{field} 疑似短时闪烁，亮度突变 {prev_diff:.1f}",
-                        episode_index=ep, frame_index=frame,
-                        field=field, path=path, fps=fps,
-                        start_sec=max(0.0, center - margin),
-                        end_sec=center + margin))
-                    if len(issues) >= int(cfg["max_issues"]):
-                        cap.release()
-                        return issues
+                    if "camera_flicker" not in reported:
+                        _video_issue(
+                            "camera_flicker",
+                            f"{field} 疑似短时闪烁，亮度突变 {prev_diff:.1f}",
+                            frame_idx - step)
                 prev_diff = diff
             prev = mean
+
+            # -- motion blur (UMI: fast motion smears the wrist views) --------
+            # Absolute Laplacian thresholds don't transfer between cameras, so
+            # sharpness is collected here (well-exposed frames only, to avoid
+            # double-reporting dark scenes) and judged against the video's own
+            # median after decoding.
+            if low_luma <= mean <= high_luma:
+                sharp_series.append(
+                    (frame_idx, float(cv2.Laplacian(gray, cv2.CV_64F).var())))
+
+            # -- exposure (dim / backlit scenes break perception) --------------
+            if "exposure" not in reported:
+                runs["dark"] = runs["dark"] + 1 if mean < low_luma else 0
+                runs["bright"] = runs["bright"] + 1 if mean > high_luma else 0
+                if runs["dark"] >= expo_need:
+                    _video_issue("exposure", f"{field} 画面持续欠曝(平均亮度 {mean:.0f} < {low_luma:g})", frame_idx)
+                elif runs["bright"] >= expo_need:
+                    _video_issue("exposure", f"{field} 画面持续过曝(平均亮度 {mean:.0f} > {high_luma:g})", frame_idx)
+
+            # -- frozen stream (encoder/driver stall repeats frames) -----------
+            if prev_gray is not None and "camera_freeze" not in reported:
+                frame_delta = float(cv2.absdiff(gray, prev_gray).mean())
+                runs["freeze"] = runs["freeze"] + 1 if frame_delta < freeze_diff else 0
+                if runs["freeze"] >= freeze_need:
+                    _video_issue(
+                        "camera_freeze",
+                        f"{field} 画面疑似冻结/重复帧({runs['freeze'] * step / fps:.1f}s 无变化)",
+                        frame_idx)
+            prev_gray = gray
+
+            if len(issues) >= int(cfg["max_issues"]):
+                cap.release()
+                return issues
         cap.release()
+        if sharp_series and "motion_blur" not in reported:
+            med = _median([s for _, s in sharp_series]) or 0.0
+            thr = max(blur_threshold, float(cfg["blur_rel_ratio"]) * med)
+            run = 0
+            for fidx, sharp in sharp_series:
+                run = run + 1 if sharp < thr else 0
+                if run >= blur_need:
+                    _video_issue(
+                        "motion_blur",
+                        f"{field} 画面持续模糊(清晰度 {sharp:.0f}，低于本视频基准 {med:.0f} 的 {100 * float(cfg['blur_rel_ratio']):.0f}%)，疑似运动过快或镜头脏污/失焦",
+                        fidx)
+                    break
     return issues
 
 
@@ -788,6 +941,10 @@ def _scan_path_uncached(root, cfg, progress=None, cancel=None):
         _check_cancel(cancel)
         _emit(progress, "检查轨迹突变/动作过快...", 40)
         issues.extend(_check_jumps(episodes, cfg, default_fps))
+        _check_cancel(cancel)
+        _emit(progress, "检查空闲停顿与 episode 时长分布...", 50)
+        issues.extend(_check_idle(episodes, cfg, default_fps))
+        issues.extend(_check_episode_length(episodes, cfg, default_fps))
     else:
         issues.append(Issue("skip", "trajectory_data", "未找到可检查的 data/*.parquet 轨迹列"))
     _check_cancel(cancel)
