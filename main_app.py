@@ -21,8 +21,10 @@ Run in the lerobot-xense env:  python main_app.py
 import datetime as dt
 import json
 import os
+import shutil
 import sys
 import time
+import zipfile
 from pathlib import Path
 
 
@@ -52,7 +54,8 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QDateEdit, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
-    QSizePolicy, QSpinBox, QStackedWidget,
+    QSizePolicy, QSpinBox, QDoubleSpinBox, QDialog, QDialogButtonBox, QFormLayout,
+    QStackedWidget,
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -562,6 +565,7 @@ class QualityWorker(QThread):
     """Run local/remote deep episode quality checks off the GUI thread."""
 
     done = Signal(int, str, list, dict, str)  # seq, dataset_name, results, aggregate, report_dir
+    progress = Signal(str, int)
 
     def __init__(self, seq, dataset, token, cfg):
         super().__init__()
@@ -570,6 +574,10 @@ class QualityWorker(QThread):
         self.dataset_name = self.dataset.get("dataset_name") or ""
         self.token = token
         self.cfg = dict(cfg or {})
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
 
     def run(self):
         checks_cfg = dict(self.cfg)
@@ -578,8 +586,17 @@ class QualityWorker(QThread):
         checks_cfg["local_quality"] = local_quality_cfg
         try:
             import dataset_quality
+            self.progress.emit("准备深度检查...", 0)
+            if self.cancel_requested:
+                raise RuntimeError("检查已取消")
+            self.progress.emit("读取本地/远程数据并定位问题...", 5)
             issues, report_dir = dataset_quality.scan_dataset_with_report(
-                self.dataset, out_dir=OUT_DIR, cfg=local_quality_cfg)
+                self.dataset, out_dir=OUT_DIR, cfg=local_quality_cfg,
+                progress=lambda text, pct=None: self.progress.emit(text, int(pct or 0)),
+                cancel=lambda: self.cancel_requested)
+            if self.cancel_requested:
+                raise RuntimeError("检查已取消")
+            self.progress.emit("生成检查报告和视频切片...", 98)
             status, message, details = chk_mod.format_local_quality_issues(issues)
             results = [chk_mod.CheckResult(
                 "episode_local_quality", "Episode 级质量定位",
@@ -587,9 +604,10 @@ class QualityWorker(QThread):
             agg = chk_mod.aggregate(results)
         except Exception as exc:
             report_dir = ""
+            msg = "检查已取消" if self.cancel_requested else f"检查出错: {exc}"
             results = [chk_mod.CheckResult(
                 "episode_local_quality", "Episode 级质量定位",
-                "local_quality", chk_mod.SKIP, f"检查出错: {exc}", [])]
+                "local_quality", chk_mod.SKIP, msg, [])]
             agg = chk_mod.aggregate(results)
         self.done.emit(self.seq, self.dataset_name, results, agg, report_dir)
 
@@ -761,6 +779,7 @@ class MainWindow(QWidget):
         self._edit_worker = None
         self._push_worker = None
         self._op_worker = None
+        self.quality_worker = None
 
         self._build_ui()
 
@@ -1109,6 +1128,22 @@ class MainWindow(QWidget):
         t.setRootIsDecorated(False)
         return t
 
+    @staticmethod
+    def _block_scroll(box):
+        """Wrap a detail block in a frameless scroll area.
+
+        A splitter never shrinks a child below its minimum size hint, so a
+        block with wide content (e.g. the 检查规则 button row) pins its drag
+        handles in place. Behind a scroll area the block can shrink to any
+        size; overflowing content just scrolls."""
+        sa = QScrollArea()
+        sa.setWidget(box)
+        sa.setWidgetResizable(True)
+        sa.setFrameShape(QFrame.NoFrame)
+        sa.setStyleSheet("QScrollArea{background:transparent;}")
+        sa.viewport().setStyleSheet("background:transparent;")
+        return sa
+
     def _build_prompt_panel(self):
         """Right-side detail panel, laid out as a grid that mirrors the viewer's
         tabs: ANNOTATIONS / STATISTICS / FILTERING / FRAMES / ACTION INSIGHTS.
@@ -1134,16 +1169,20 @@ class MainWindow(QWidget):
         self.report_progress.setVisible(False)
         pv.addWidget(self.report_progress)
 
-        # --- grid of viewer-mirroring panels --------------------------------
-        self.detail_grid = QWidget()
-        grid = QGridLayout(self.detail_grid)
-        grid.setContentsMargins(0, 0, 0, 0)
-        grid.setColumnStretch(0, 1)
-        grid.setColumnStretch(1, 1)
-        grid.setRowStretch(0, 2)  # ANNOTATIONS(0,0 span2) | STATISTICS
-        grid.setRowStretch(1, 2)  # ANNOTATIONS cont       | 检查规则
-        grid.setRowStretch(2, 2)  # FILTERING              | FRAMES
-        grid.setRowStretch(3, 3)  # ACTION INSIGHTS (span 2)
+        # --- nested splitters of viewer-mirroring panels ---------------------
+        # Every block boundary is a drag handle, so each block can be freely
+        # enlarged/shrunk and its neighbours take up the slack — the fixed
+        # grid ratios never fit both laptop and wide screens.
+        splitter_css = "QSplitter::handle{background:#dcecdc;}"
+        self.detail_grid = QSplitter(Qt.Vertical)   # top row | mid row | insights
+        detail_top = QSplitter(Qt.Horizontal)       # ANNOTATIONS | (STATISTICS/检查规则)
+        detail_right_col = QSplitter(Qt.Vertical)   # STATISTICS over 检查规则
+        detail_mid = QSplitter(Qt.Horizontal)       # FILTERING | FRAMES
+        for sp in (self.detail_grid, detail_top, detail_right_col, detail_mid):
+            sp.setHandleWidth(10)  # wide enough to grab on high-DPI screens
+            sp.setStyleSheet(splitter_css)
+        self.detail_grid.addWidget(detail_top)
+        self.detail_grid.addWidget(detail_mid)
 
         # 浅绿色分组样式 — 与右侧「数据集检查分区」保持一致
         green_box_css = (
@@ -1182,7 +1221,8 @@ class MainWindow(QWidget):
         self.anno_note.setStyleSheet("color: #999; font-size: 12px;")
         self.anno_note.setWordWrap(True)
         al.addWidget(self.anno_note)
-        grid.addWidget(ann_box, 0, 0, 2, 1)  # tall: spans rows 0-1
+        detail_top.addWidget(self._block_scroll(ann_box))  # left column, tall
+        detail_top.addWidget(detail_right_col)
 
         # STATISTICS 统计信息 — dataset/episode stats (from report)
         stat_box = QGroupBox("STATISTICS 统计信息")
@@ -1192,23 +1232,74 @@ class MainWindow(QWidget):
         self.stat_view.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.stat_view.setTextInteractionFlags(Qt.TextSelectableByMouse)
         sl.addWidget(self.stat_view, 1)
-        grid.addWidget(stat_box, 0, 1)
+        detail_right_col.addWidget(self._block_scroll(stat_box))
 
         # 检查规则 — custom quality-check results for the selected dataset
         rules_box = QGroupBox("检查规则")
         rules_box.setStyleSheet(green_box_css)
         rul = QVBoxLayout(rules_box)
-        qrow = QHBoxLayout()
+        # Two rows so the block's natural width stays small enough to drag.
         self.btn_quality_check = QPushButton("执行深度检查")
         self.btn_quality_check.setToolTip("按需缓存远程文件并生成问题视频切片，耗时操作会在后台执行。")
         self.btn_quality_check.clicked.connect(self.on_quality_check)
-        qrow.addWidget(self.btn_quality_check)
-        qrow.addStretch(1)
-        rul.addLayout(qrow)
+        self.btn_quality_cancel = QPushButton("取消")
+        self.btn_quality_cancel.setEnabled(False)
+        self.btn_quality_cancel.clicked.connect(self.on_quality_cancel)
+        self.btn_open_quality_report = QPushButton("打开报告")
+        self.btn_open_quality_report.clicked.connect(self.on_open_quality_report)
+        self.btn_export_quality_report = QPushButton("导出ZIP")
+        self.btn_export_quality_report.clicked.connect(self.on_export_quality_report)
+        self.btn_clear_quality_reports = QPushButton("清理报告")
+        self.btn_clear_quality_reports.clicked.connect(self.on_clear_quality_reports)
+        self.btn_clear_quality_cache = QPushButton("清理缓存")
+        self.btn_clear_quality_cache.clicked.connect(self.on_clear_quality_cache)
+        self.btn_quality_settings = QPushButton("检查设置")
+        self.btn_quality_settings.clicked.connect(self.on_quality_settings)
+        for group in (
+            (self.btn_quality_check, self.btn_quality_cancel,
+             self.btn_open_quality_report, self.btn_export_quality_report),
+            (self.btn_clear_quality_reports, self.btn_clear_quality_cache,
+             self.btn_quality_settings),
+        ):
+            qrow = QHBoxLayout()
+            for btn in group:
+                qrow.addWidget(btn)
+            qrow.addStretch(1)
+            rul.addLayout(qrow)
+        self.quality_progress = QProgressBar()
+        self.quality_progress.setRange(0, 100)
+        self.quality_progress.setVisible(False)
+        rul.addWidget(self.quality_progress)
+        self.quality_note = QLabel("")
+        self.quality_note.setStyleSheet("color: #777; font-size: 12px;")
+        self.quality_note.setWordWrap(True)
+        rul.addWidget(self.quality_note)
         self.check_tree = self._panel_tree()
         self.check_tree.setRootIsDecorated(True)
         rul.addWidget(self.check_tree, 1)
-        grid.addWidget(rules_box, 1, 1)
+        self.quality_overview = QLabel("")
+        self.quality_overview.setStyleSheet("color:#555; font-size:12px;")
+        self.quality_overview.setWordWrap(True)
+        rul.addWidget(self.quality_overview)
+        issue_btn_row = QHBoxLayout()
+        for label, status in (
+            ("确认问题", "确认问题"),
+            ("误报", "误报"),
+            ("已修复", "已修复"),
+            ("未确认", "未确认"),
+        ):
+            btn = QPushButton(label)
+            btn.clicked.connect(lambda _=False, s=status: self.on_mark_quality_issue(s))
+            issue_btn_row.addWidget(btn)
+        issue_btn_row.addStretch(1)
+        rul.addLayout(issue_btn_row)
+        self.quality_issue_tree = QTreeWidget()
+        self.quality_issue_tree.setHeaderLabels(["#", "episode", "问题", "字段", "时间", "确认状态"])
+        self.quality_issue_tree.setRootIsDecorated(False)
+        self.quality_issue_tree.setAlternatingRowColors(True)
+        self.quality_issue_tree.setMinimumHeight(60)
+        rul.addWidget(self.quality_issue_tree)
+        detail_right_col.addWidget(self._block_scroll(rules_box))
 
         # FILTERING 过滤器 — smoothness "Overall" verdict + breakdown lines
         filt_box = QGroupBox("FILTERING 过滤器")
@@ -1218,7 +1309,7 @@ class MainWindow(QWidget):
         self.filter_view.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.filter_view.setTextInteractionFlags(Qt.TextSelectableByMouse)
         fl.addWidget(self.filter_view, 1)
-        grid.addWidget(filt_box, 2, 0)
+        detail_mid.addWidget(self._block_scroll(filt_box))
 
         # FRAMES 首位帧 — placeholder (not implemented yet)
         frames_box = QGroupBox("FRAMES 首位帧")
@@ -1227,7 +1318,7 @@ class MainWindow(QWidget):
         ph.setStyleSheet("color: #bbb;")
         ph.setAlignment(Qt.AlignCenter)
         frl.addWidget(ph, 1)
-        grid.addWidget(frames_box, 2, 1)
+        detail_mid.addWidget(self._block_scroll(frames_box))
 
         # ACTION INSIGHTS 行动指导与训练配置 — training config (report)
         insight_box = QGroupBox("ACTION INSIGHTS 行动指导与训练配置")
@@ -1237,7 +1328,19 @@ class MainWindow(QWidget):
         self.insight_view.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.insight_view.setTextInteractionFlags(Qt.TextSelectableByMouse)
         il.addWidget(self.insight_view, 1)
-        grid.addWidget(insight_box, 3, 0, 1, 2)
+        self.detail_grid.addWidget(self._block_scroll(insight_box))
+
+        # Initial proportions mirror the old grid (rows 2/2/2/3, columns 1:1);
+        # from there every handle is user-draggable.
+        detail_top.setStretchFactor(0, 1)
+        detail_top.setStretchFactor(1, 1)
+        detail_right_col.setStretchFactor(0, 1)
+        detail_right_col.setStretchFactor(1, 1)
+        detail_mid.setStretchFactor(0, 1)
+        detail_mid.setStretchFactor(1, 1)
+        self.detail_grid.setStretchFactor(0, 4)  # ANNOTATIONS + STATISTICS/检查规则
+        self.detail_grid.setStretchFactor(1, 2)  # FILTERING | FRAMES
+        self.detail_grid.setStretchFactor(2, 3)  # ACTION INSIGHTS
 
         pv.addWidget(self.detail_grid, 1)
 
@@ -2424,6 +2527,7 @@ class MainWindow(QWidget):
         n_tasks = self._refresh_tasks(inline_tasks, task_path)
         n_anno_eps, total_eps = self._refresh_annotations(anno_path)
         agg = self._refresh_checks(d)
+        self._refresh_quality_report_panel(d)
         self._refresh_report(d)
 
         bits = [f"数据集: {name}", f"{n_tasks} 条指令"]
@@ -2481,6 +2585,236 @@ class MainWindow(QWidget):
             return
         self._start_quality_check(d)
 
+    def _current_quality_report(self):
+        d = self._selected_dataset()
+        name = (d or {}).get("dataset_name")
+        report_dir = self._quality_reports.get(name or "")
+        if report_dir and Path(report_dir).is_dir():
+            return name, Path(report_dir)
+        return name, None
+
+    def _refresh_quality_report_panel(self, d=None):
+        if not hasattr(self, "quality_issue_tree"):
+            return
+        self.quality_issue_tree.clear()
+        if hasattr(self, "quality_overview"):
+            self.quality_overview.setText("")
+        d = d or self._selected_dataset()
+        name = (d or {}).get("dataset_name")
+        report_dir = self._quality_reports.get(name or "")
+        if not report_dir or not Path(report_dir).is_dir():
+            return
+        try:
+            import dataset_quality
+            records = dataset_quality.load_report_records(report_dir)
+            summary = dataset_quality.summarize_records(records)
+        except Exception as exc:
+            if hasattr(self, "quality_overview"):
+                self.quality_overview.setText(f"报告读取失败: {exc}")
+            return
+        if hasattr(self, "quality_overview"):
+            rule_text = ", ".join(f"{k}:{v}" for k, v in list(summary["by_rule"].items())[:4]) or "无"
+            field_text = ", ".join(f"{k}:{v}" for k, v in list(summary["by_field"].items())[:4]) or "无"
+            self.quality_overview.setText(
+                f"质量总览：问题 {summary['total_issues']} 项，涉及 episode {summary['episode_count']} 条，"
+                f"未确认 {summary['unconfirmed']} 项；问题类型 {rule_text}；字段/摄像机 {field_text}")
+        for i, rec in enumerate(records, 1):
+            start = rec.get("start_sec")
+            end = rec.get("end_sec")
+            time_text = (
+                f"{float(start):.3f}s-{float(end):.3f}s"
+                if start is not None and end is not None else
+                (f"frame {rec.get('frame')}" if rec.get("frame") is not None else "-")
+            )
+            item = QTreeWidgetItem([
+                str(i),
+                "-" if rec.get("episode") is None else str(rec.get("episode")),
+                rec.get("rule") or "-",
+                rec.get("field") or "-",
+                time_text,
+                rec.get("review_status", "未确认"),
+            ])
+            item.setToolTip(2, rec.get("message") or "")
+            item.setData(0, Qt.UserRole, rec.get("issue_id"))
+            self.quality_issue_tree.addTopLevelItem(item)
+        for col in range(self.quality_issue_tree.columnCount()):
+            self.quality_issue_tree.resizeColumnToContents(col)
+
+    def on_mark_quality_issue(self, status):
+        name, report_dir = self._current_quality_report()
+        if not name or not report_dir:
+            QMessageBox.warning(self, "提示", "当前数据集没有可标记的检查报告。")
+            return
+        item = self.quality_issue_tree.currentItem() if hasattr(self, "quality_issue_tree") else None
+        if not item:
+            QMessageBox.warning(self, "提示", "请先在下方问题列表中选中一条问题。")
+            return
+        issue_id = item.data(0, Qt.UserRole)
+        try:
+            import dataset_quality
+            records = dataset_quality.load_report_records(report_dir)
+            for rec in records:
+                if rec.get("issue_id") == issue_id:
+                    rec["review_status"] = status
+                    break
+            dataset_quality.save_review_status(report_dir, records)
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"保存确认状态失败: {exc}")
+            return
+        self._refresh_quality_report_panel()
+        self.status.setText(f"已标记问题为: {status}")
+
+    def on_open_quality_report(self):
+        name, report_dir = self._current_quality_report()
+        if not name:
+            QMessageBox.warning(self, "提示", "请先选中一个数据集。")
+            return
+        if not report_dir:
+            self._mark_quality_unchecked(name)
+            QMessageBox.warning(self, "提示", "当前数据集没有可打开的检查报告。")
+            return
+        summary = report_dir / "summary.html"
+        target = summary if summary.is_file() else report_dir
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(target.resolve())))
+        self.status.setText(f"已打开检查报告: {target}")
+
+    def on_export_quality_report(self):
+        name, report_dir = self._current_quality_report()
+        if not name:
+            QMessageBox.warning(self, "提示", "请先选中一个数据集。")
+            return
+        if not report_dir:
+            self._mark_quality_unchecked(name)
+            QMessageBox.warning(self, "提示", "当前数据集没有可导出的检查报告。")
+            return
+        zip_path = report_dir.with_suffix(".zip")
+        if zip_path.exists():
+            zip_path.unlink()
+        with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for path in report_dir.rglob("*"):
+                if path.is_file():
+                    zf.write(path, path.relative_to(report_dir.parent))
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(zip_path.parent.resolve())))
+        self.status.setText(f"已导出检查报告 ZIP: {zip_path}")
+
+    def on_clear_quality_reports(self):
+        name, report_dir = self._current_quality_report()
+        if not name:
+            QMessageBox.warning(self, "提示", "请先选中一个数据集。")
+            return
+        if not report_dir:
+            self._mark_quality_unchecked(name)
+            QMessageBox.information(self, "提示", "当前数据集没有检查报告产物。")
+            return
+        answer = QMessageBox.question(
+            self, "确认清理",
+            f"确认删除当前数据集的检查报告？\n{report_dir.parent}")
+        if answer != QMessageBox.Yes:
+            return
+        shutil.rmtree(report_dir.parent, ignore_errors=True)
+        self._mark_quality_unchecked(name)
+        self.status.setText(f"已清理检查报告: {name}")
+
+    def on_clear_quality_cache(self):
+        cfg = (_CHECKS_CFG.get("local_quality") or {})
+        cache_dir = Path(cfg.get("remote_cache_dir", ".quality_cache"))
+        answer = QMessageBox.question(
+            self, "确认清理",
+            f"确认删除远程检查缓存？\n{cache_dir.resolve()}")
+        if answer != QMessageBox.Yes:
+            return
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        self.status.setText(f"已清理检查缓存: {cache_dir}")
+
+    def on_quality_settings(self):
+        cfg = dict(_CHECKS_CFG.get("local_quality") or {})
+        dlg = QDialog(self)
+        dlg.setWindowTitle("深度检查设置")
+        dlg.setMinimumWidth(420)
+        form = QFormLayout(dlg)
+
+        widgets = {}
+
+        def add_double(key, label, minimum, maximum, step):
+            w = QDoubleSpinBox()
+            w.setRange(minimum, maximum)
+            w.setSingleStep(step)
+            w.setDecimals(3)
+            w.setValue(float(cfg.get(key, 0)))
+            form.addRow(label, w)
+            widgets[key] = w
+
+        def add_int(key, label, minimum, maximum):
+            w = QSpinBox()
+            w.setRange(minimum, maximum)
+            w.setValue(int(cfg.get(key, 0)))
+            form.addRow(label, w)
+            widgets[key] = w
+
+        add_int("start_end_window", "首尾均值窗口帧数", 1, 200)
+        add_double("boundary_abs_threshold", "首尾偏差绝对阈值", 0.0, 10.0, 0.05)
+        add_double("boundary_mad_factor", "首尾偏差 MAD 倍数", 1.0, 50.0, 0.5)
+        add_double("jump_abs_threshold", "轨迹突变绝对阈值", 0.0, 10.0, 0.05)
+        add_double("jump_mad_factor", "轨迹突变 MAD 倍数", 1.0, 80.0, 0.5)
+        add_int("flicker_sample_step", "视频闪烁抽帧步长", 1, 30)
+        add_double("flicker_luma_threshold", "闪烁亮度阈值", 1.0, 255.0, 1.0)
+        add_double("flicker_recover_ratio", "闪烁恢复比例", 0.0, 2.0, 0.05)
+        add_int("max_video_frames", "每路最多检查帧数", 1, 200000)
+        add_double("clip_margin_sec", "问题前后基础范围(s)", 0.0, 20.0, 0.5)
+        add_double("clip_lead_sec", "切片前置冗余(s)", 0.0, 20.0, 0.5)
+        add_double("clip_max_sec", "单切片最长(s)", 1.0, 60.0, 1.0)
+        add_int("max_issues", "最多记录问题数", 1, 1000)
+        remote_enabled = QCheckBox("启用远程按需缓存检查")
+        remote_enabled.setChecked(bool(cfg.get("remote_enabled", True)))
+        form.addRow("远程检查", remote_enabled)
+        widgets["remote_enabled"] = remote_enabled
+
+        note = QLabel("保存后立即用于本次进程，并写入 config.json；已存在报告不会自动重算。")
+        note.setStyleSheet("color:#888; font-size:12px;")
+        note.setWordWrap(True)
+        form.addRow(note)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        form.addRow(bb)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        new_cfg = dict(cfg)
+        for key, widget in widgets.items():
+            if isinstance(widget, QCheckBox):
+                new_cfg[key] = widget.isChecked()
+            elif isinstance(widget, QSpinBox):
+                new_cfg[key] = int(widget.value())
+            else:
+                new_cfg[key] = float(widget.value())
+        _CHECKS_CFG.setdefault("local_quality", {}).update(new_cfg)
+        try:
+            config_path = Path("config.json")
+            raw = json.loads(config_path.read_text(encoding="utf-8"))
+            raw.setdefault("checks", {}).setdefault("local_quality", {}).update(new_cfg)
+            config_path.write_text(json.dumps(raw, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+            self.status.setText("深度检查设置已保存。")
+        except Exception as exc:
+            QMessageBox.warning(self, "提示", f"设置已应用到本次进程，但写入 config.json 失败: {exc}")
+
+    def on_quality_cancel(self):
+        worker = getattr(self, "quality_worker", None)
+        if worker and worker.isRunning():
+            worker.cancel()
+            self._quality_seq = getattr(self, "_quality_seq", 0) + 1
+            name = getattr(self, "_quality_dataset_name", "")
+            if name:
+                self._mark_quality_unchecked(name)
+            if hasattr(self, "quality_note"):
+                self.quality_note.setText("已请求取消；后台任务会在当前处理阶段结束后退出。")
+            if hasattr(self, "quality_progress"):
+                self.quality_progress.setVisible(False)
+            if hasattr(self, "btn_quality_check"):
+                self.btn_quality_check.setEnabled(True)
+            if hasattr(self, "btn_quality_cancel"):
+                self.btn_quality_cancel.setEnabled(False)
+
     def _start_quality_check(self, d):
         self._quality_seq = getattr(self, "_quality_seq", 0) + 1
         seq = self._quality_seq
@@ -2491,6 +2825,13 @@ class MainWindow(QWidget):
             self._update_quality_status_cells(name)
         if hasattr(self, "btn_quality_check"):
             self.btn_quality_check.setEnabled(False)
+        if hasattr(self, "btn_quality_cancel"):
+            self.btn_quality_cancel.setEnabled(True)
+        if hasattr(self, "quality_progress"):
+            self.quality_progress.setVisible(True)
+            self.quality_progress.setValue(0)
+        if hasattr(self, "quality_note"):
+            self.quality_note.setText("检查中，GUI 可继续操作。")
         idx = self.check_tree.indexOfTopLevelItem(getattr(self, "_quality_group", None))
         if idx >= 0:
             self.check_tree.takeTopLevelItem(idx)
@@ -2500,29 +2841,51 @@ class MainWindow(QWidget):
                 "episode_local_quality", "Episode 级质量定位", "local_quality",
                 chk_mod.SKIP, "检查中，GUI 可继续操作...", [])])
         self.quality_worker = QualityWorker(seq, d, self.token, _CHECKS_CFG)
+        self.quality_worker.progress.connect(self._on_quality_progress)
         self.quality_worker.done.connect(self._on_quality_done)
         self.quality_worker.start()
 
+    def _on_quality_progress(self, text, pct=0):
+        if hasattr(self, "quality_note"):
+            self.quality_note.setText(text)
+        if hasattr(self, "quality_progress"):
+            self.quality_progress.setValue(max(0, min(100, int(pct or 0))))
+
     def _on_quality_done(self, seq, name, results, _agg, report_dir):
-        if name:
-            self._quality_status[name] = "已检查"
-            if report_dir:
-                self._quality_reports[name] = report_dir
-                self._quality_records[name] = {
-                    "status": "已检查",
-                    "report_dir": report_dir,
-                    "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
-                }
-                self._save_quality_records()
-            self._update_quality_status_cells(name)
         if seq != getattr(self, "_quality_seq", None):
             return
+        if name and report_dir and Path(report_dir).is_dir():
+            self._quality_status[name] = "已检查"
+            self._quality_reports[name] = report_dir
+            self._quality_records[name] = {
+                "status": "已检查",
+                "report_dir": report_dir,
+                "checked_at": dt.datetime.now().isoformat(timespec="seconds"),
+            }
+            self._save_quality_records()
+            self.status.setText(f"深度检查完成，报告: {report_dir}")
+        elif name:
+            self._quality_status[name] = "未检查"
+            self._quality_records.pop(name, None)
+            self._quality_reports.pop(name, None)
+            self._save_quality_records()
+            self._update_quality_status_cells(name)
+        if name:
+            self._update_quality_status_cells(name)
+        if name == ((self._selected_dataset() or {}).get("dataset_name")):
+            self._refresh_quality_report_panel()
         idx = self.check_tree.indexOfTopLevelItem(getattr(self, "_quality_group", None))
         if idx >= 0:
             self.check_tree.takeTopLevelItem(idx)
         self._quality_group = self._add_check_group("本地/远程深度检查", results)
         if hasattr(self, "btn_quality_check"):
             self.btn_quality_check.setEnabled(True)
+        if hasattr(self, "btn_quality_cancel"):
+            self.btn_quality_cancel.setEnabled(False)
+        if hasattr(self, "quality_progress"):
+            self.quality_progress.setVisible(False)
+        if hasattr(self, "quality_note"):
+            self.quality_note.setText(f"报告目录: {report_dir}" if report_dir else "未生成报告。")
 
     # ---- Viewer /report analysis (async → STATISTICS/FILTERING/INSIGHTS) --- #
     _VERDICT_COLOR = {
