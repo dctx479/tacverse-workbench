@@ -15,12 +15,18 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import csv
+import html
 import math
 import re
 import shutil
 import json
 from pathlib import Path
 import datetime as _dt
+
+
+class QualityCancelled(RuntimeError):
+    """Raised when the GUI asks a long-running quality scan to stop."""
 
 
 STREAM_FIELDS = (
@@ -561,12 +567,18 @@ def _clip_targets(issue, fields):
     return wrists or ([next(iter(fields))] if fields else [])
 
 
-def _attach_clips(root, issues, cfg, default_fps):
+def _attach_clips(root, issues, cfg, default_fps, progress=None, cancel=None):
     videos = _videos_by_episode(root)
     clip_root = root / "quality_clips"
+    actionable = sum(1 for x in issues if x.severity in ("warn", "fail"))
+    done = 0
     for issue in issues:
         if issue.severity not in ("warn", "fail"):
             continue
+        _check_cancel(cancel)
+        done += 1
+        pct = 88 + int(7 * (done - 1) / actionable) if actionable else 88
+        _emit(progress, f"生成问题视频切片 {done}/{actionable}...", pct)
         if issue.episode_index is None:
             continue
         fields = videos.get(issue.episode_index) or {}
@@ -625,7 +637,7 @@ def _attach_clips(root, issues, cfg, default_fps):
     return issues
 
 
-def _check_flicker(root, cfg):
+def _check_flicker(root, cfg, progress=None, cancel=None):
     try:
         import cv2
     except Exception as exc:
@@ -636,7 +648,15 @@ def _check_flicker(root, cfg):
     luma_threshold = float(cfg["flicker_luma_threshold"])
     recover_ratio = float(cfg["flicker_recover_ratio"])
     max_frames = int(cfg["max_video_frames"])
-    for field, path in _video_paths(root):
+    videos = _video_paths(root)
+    total = len(videos)
+    for vid_no, (field, path) in enumerate(videos, 1):
+        _check_cancel(cancel)
+        # This is by far the longest stage (full decode of every stream), so
+        # report per-video progress across the 60-75% band instead of sitting
+        # silently at 60%.
+        pct = 60 + int(15 * (vid_no - 1) / total) if total else 60
+        _emit(progress, f"检查视频闪烁 {vid_no}/{total}: {path.name}", pct)
         ep = _episode_from_name(path)
         cap = cv2.VideoCapture(str(path))
         if not cap.isOpened():
@@ -655,6 +675,9 @@ def _check_flicker(root, cfg):
             if frame_idx % step:
                 continue
             sampled += 1
+            if sampled % 600 == 0 and cancel and cancel():
+                cap.release()  # keep 取消 responsive mid-video
+                raise QualityCancelled("检查已取消")
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             mean = float(gray.mean())
             if prev is not None:
@@ -740,35 +763,68 @@ def _check_jpeg_logs(root, cfg, fps):
     return issues
 
 
+def _emit(progress, text, pct=None):
+    if progress:
+        progress(text, pct)
+
+
+def _check_cancel(cancel):
+    if cancel and cancel():
+        raise QualityCancelled("检查已取消")
+
+
+def _scan_path_uncached(root, cfg, progress=None, cancel=None):
+    root = Path(root)
+    issues = []
+    _check_cancel(cancel)
+    _emit(progress, "读取 parquet 轨迹数据...", 10)
+    episodes, read_issues = _read_data_tables(root)
+    issues.extend(read_issues)
+    default_fps = float(cfg.get("fps") or 30.0)
+    _check_cancel(cancel)
+    if episodes:
+        _emit(progress, f"检查首尾位置偏差，共 {len(episodes)} 条 episode...", 25)
+        issues.extend(_check_boundaries(episodes, cfg, default_fps))
+        _check_cancel(cancel)
+        _emit(progress, "检查轨迹突变/动作过快...", 40)
+        issues.extend(_check_jumps(episodes, cfg, default_fps))
+    else:
+        issues.append(Issue("skip", "trajectory_data", "未找到可检查的 data/*.parquet 轨迹列"))
+    _check_cancel(cancel)
+    _emit(progress, "检查视频闪烁/白屏线索...", 60)
+    issues.extend(_check_flicker(root, cfg, progress=progress, cancel=cancel))
+    _check_cancel(cancel)
+    _emit(progress, "扫描 JPEG/相机异常日志...", 75)
+    issues.extend(_check_jpeg_logs(root, cfg, default_fps))
+    _check_cancel(cancel)
+    _emit(progress, "生成问题视频切片...", 88)
+    issues = _attach_clips(root, issues, cfg, default_fps,
+                           progress=progress, cancel=cancel)
+    max_issues = int(cfg["max_issues"])
+    _emit(progress, "检查规则完成。", 95)
+    return tuple(issues[:max_issues])
+
+
 @lru_cache(maxsize=32)
 def scan_path(root_str, cfg_items):
     root = Path(root_str)
     cfg = _cfg(dict(cfg_items))
-    issues = []
-    episodes, read_issues = _read_data_tables(root)
-    issues.extend(read_issues)
-    default_fps = float(cfg.get("fps") or 30.0)
-    if episodes:
-        issues.extend(_check_boundaries(episodes, cfg, default_fps))
-        issues.extend(_check_jumps(episodes, cfg, default_fps))
-    else:
-        issues.append(Issue("skip", "trajectory_data", "未找到可检查的 data/*.parquet 轨迹列"))
-    issues.extend(_check_flicker(root, cfg))
-    issues.extend(_check_jpeg_logs(root, cfg, default_fps))
-    issues = _attach_clips(root, issues, cfg, default_fps)
-    max_issues = int(cfg["max_issues"])
-    return tuple(issues[:max_issues])
+    return _scan_path_uncached(root, cfg)
 
 
-def scan_dataset(dataset, out_dir="pulls", cfg=None):
+def scan_dataset(dataset, out_dir="pulls", cfg=None, progress=None, cancel=None):
     root = dataset_dir(dataset, out_dir)
     merged = _cfg(cfg)
     if (dataset or {}).get("fps"):
         merged["fps"] = dataset.get("fps")
     if not root:
+        _emit(progress, "远程按需缓存检查文件...", 5)
         root, error = remote_dataset_dir(dataset, merged)
         if not root:
             return [Issue("skip", "remote_dataset", error or "无法获取远程检查所需文件")]
+    _check_cancel(cancel)
+    if progress or cancel:
+        return list(_scan_path_uncached(root.resolve(), merged, progress=progress, cancel=cancel))
     return list(scan_path(str(root.resolve()), tuple(sorted(merged.items()))))
 
 
@@ -784,6 +840,93 @@ def _issue_line(issue):
         parts.append(issue.field)
     prefix = " / ".join(parts)
     return f"{prefix}: {issue.message}" if prefix else issue.message
+
+
+def _issue_record(issue, clips=None):
+    return {
+        "episode": issue.episode_index,
+        "rule": issue.rule,
+        "severity": issue.severity,
+        "field": issue.field,
+        "start_sec": issue.start_sec,
+        "end_sec": issue.end_sec,
+        "frame": issue.frame_index,
+        "message": issue.message,
+        "source": issue.path,
+        "clips": clips or {},
+        "review_status": "未确认",
+    }
+
+
+def _issue_id(rec, fallback):
+    ep = "unknown" if rec.get("episode") is None else f"{int(rec['episode']):06d}"
+    start = rec.get("start_sec")
+    start_text = "frame" if start is None else f"{float(start):.3f}"
+    return f"{fallback:04d}_{ep}_{_safe_name(rec.get('rule'))}_{_safe_name(rec.get('field') or 'all')}_{start_text}"
+
+
+def summarize_records(records):
+    actionable = list(records or [])
+    by_rule = {}
+    by_field = {}
+    by_ep = {}
+    unconfirmed = 0
+    for rec in actionable:
+        by_rule[rec.get("rule") or "unknown"] = by_rule.get(rec.get("rule") or "unknown", 0) + 1
+        by_field[rec.get("field") or "unknown"] = by_field.get(rec.get("field") or "unknown", 0) + 1
+        ep = rec.get("episode")
+        ep_key = "unknown" if ep is None else str(ep)
+        by_ep[ep_key] = by_ep.get(ep_key, 0) + 1
+        if rec.get("review_status", "未确认") == "未确认":
+            unconfirmed += 1
+    return {
+        "total_issues": len(actionable),
+        "episode_count": len(by_ep),
+        "by_rule": dict(sorted(by_rule.items(), key=lambda x: (-x[1], x[0]))),
+        "by_field": dict(sorted(by_field.items(), key=lambda x: (-x[1], x[0]))),
+        "by_episode": dict(sorted(by_ep.items(), key=lambda x: (x[0] == "unknown", x[0]))),
+        "unconfirmed": unconfirmed,
+    }
+
+
+def load_report_records(report_dir):
+    try:
+        rows = json.loads((Path(report_dir) / "issues.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(rows, list):
+        return []
+    review = {}
+    try:
+        review = json.loads((Path(report_dir) / "review_status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        review = {}
+    for i, rec in enumerate(rows, 1):
+        issue_id = rec.get("issue_id") or _issue_id(rec, i)
+        rec["issue_id"] = issue_id
+        status_rec = review.get(issue_id) or review.get(str(i)) or {}
+        if isinstance(status_rec, dict):
+            rec["review_status"] = status_rec.get("status", rec.get("review_status", "未确认"))
+            rec["review_note"] = status_rec.get("note", rec.get("review_note", ""))
+    return rows
+
+
+def save_review_status(report_dir, records):
+    review = {}
+    for i, rec in enumerate(records or [], 1):
+        issue_id = rec.get("issue_id") or _issue_id(rec, i)
+        review[issue_id] = {
+            "episode": rec.get("episode"),
+            "rule": rec.get("rule"),
+            "field": rec.get("field"),
+            "start_sec": rec.get("start_sec"),
+            "end_sec": rec.get("end_sec"),
+            "status": rec.get("review_status", "未确认"),
+            "note": rec.get("review_note", ""),
+        }
+    (Path(report_dir) / "review_status.json").write_text(
+        json.dumps(review, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
 
 
 def _clip_camera_name(issue):
@@ -808,6 +951,7 @@ def write_report(dataset, issues, cfg=None):
     report_root.mkdir(parents=True, exist_ok=True)
 
     by_ep = {}
+    all_records = []
     for issue in actionable:
         ep = issue.episode_index if issue.episode_index is not None else "unknown"
         by_ep.setdefault(ep, []).append(issue)
@@ -828,11 +972,17 @@ def write_report(dataset, issues, cfg=None):
         index_lines.append(f"- [{ep_dir.name}]({ep_dir.name}/report.md): {len(by_ep[ep])} issues")
         lines = [f"# {repo_id} / {ep_dir.name}", ""]
         clip_counts = {}
+        ep_records = []
         for i, issue in enumerate(by_ep[ep], 1):
             clip_names = []
+            clip_links = {}
             source_clips = issue.clip_paths or {}
             if not source_clips and issue.clip_path:
                 source_clips = {_clip_camera_name(issue): issue.clip_path}
+            issue_global_index = len(all_records) + 1
+            issue_id = _issue_id(_issue_record(issue), issue_global_index)
+            start_text = "na" if issue.start_sec is None else f"{issue.start_sec:.3f}"
+            end_text = "na" if issue.end_sec is None else f"{issue.end_sec:.3f}"
             for camera, clip_path in source_clips.items():
                 if not clip_path or not Path(clip_path).is_file():
                     continue
@@ -840,12 +990,22 @@ def write_report(dataset, issues, cfg=None):
                 camera = _safe_name(camera)
                 clip_counts[camera] = clip_counts.get(camera, 0) + 1
                 suffix = "" if clip_counts[camera] == 1 else f"_{clip_counts[camera]:02d}"
-                clip_name = f"{camera}{suffix}{src.suffix or '.mp4'}"
+                ep_text = f"ep{int(ep):06d}" if isinstance(ep, int) else "ep_unknown"
+                clip_name = (
+                    f"{ep_text}_{_safe_name(issue.rule)}_{camera}_"
+                    f"{start_text}-{end_text}{suffix}{src.suffix or '.mp4'}"
+                )
                 shutil.copy2(src, ep_dir / clip_name)
                 clip_names.append(clip_name)
+                clip_links[camera] = str(Path(ep_dir.name) / clip_name)
+            rec = _issue_record(issue, clip_links)
+            rec["issue_id"] = issue_id
+            ep_records.append(rec)
+            all_records.append(rec)
             lines.extend([
                 f"## {i}. {issue.rule}",
                 "",
+                f"- issue_id: {issue_id}",
                 f"- severity: {issue.severity}",
                 f"- field: {issue.field or '-'}",
                 f"- time: {issue.start_sec:.3f}s-{issue.end_sec:.3f}s" if issue.start_sec is not None and issue.end_sec is not None else f"- frame: {issue.frame_index}",
@@ -857,8 +1017,83 @@ def write_report(dataset, issues, cfg=None):
                 lines.append(f"- source: {issue.path}")
             lines.append("")
         (ep_dir / "report.md").write_text("\n".join(lines), encoding="utf-8")
+        (ep_dir / "issues.json").write_text(
+            json.dumps(ep_records, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
 
     (report_root / "index.md").write_text("\n".join(index_lines) + "\n", encoding="utf-8")
+    (report_root / "issues.json").write_text(
+        json.dumps(all_records, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    summary = summarize_records(all_records)
+    (report_root / "overview.json").write_text(
+        json.dumps(summary, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
+    with (report_root / "issues.csv").open("w", newline="", encoding="utf-8-sig") as fh:
+        writer = csv.DictWriter(
+            fh,
+            fieldnames=[
+                "issue_id", "episode", "rule", "severity", "field", "start_sec", "end_sec",
+                "frame", "message", "source", "clips", "review_status",
+            ])
+        writer.writeheader()
+        for rec in all_records:
+            row = dict(rec)
+            row["clips"] = json.dumps(row["clips"], ensure_ascii=False)
+            writer.writerow(row)
+    save_review_status(report_root, all_records)
+    html_rows = []
+    for i, rec in enumerate(all_records, 1):
+        clips = []
+        for camera, rel in (rec.get("clips") or {}).items():
+            rel_esc = html.escape(rel)
+            camera_esc = html.escape(camera)
+            clips.append(
+                f'<div><a href="{rel_esc}">{camera_esc}</a><br>'
+                f'<video src="{rel_esc}" controls width="260"></video></div>')
+        start_text = "" if rec["start_sec"] is None else f"{rec['start_sec']:.3f}"
+        end_text = "" if rec["end_sec"] is None else f"{rec['end_sec']:.3f}"
+        html_rows.append(
+            "<tr>"
+            f"<td>{i}</td>"
+            f"<td>{html.escape(str(rec['episode']))}</td>"
+            f"<td>{html.escape(rec['rule'])}</td>"
+            f"<td>{html.escape(rec['severity'])}</td>"
+            f"<td>{html.escape(str(rec.get('field') or '-'))}</td>"
+            f"<td>{start_text}</td>"
+            f"<td>{end_text}</td>"
+            f"<td>{html.escape(rec['message'])}</td>"
+            f"<td>{', '.join(clips) or '-'}</td>"
+            f"<td>{html.escape(rec['review_status'])}</td>"
+            "</tr>")
+    summary_html = f"""<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>Quality report - {html.escape(repo_id)}</title>
+<style>
+body{{font-family:Arial,'Microsoft YaHei',sans-serif;margin:24px;color:#222}}
+table{{border-collapse:collapse;width:100%;font-size:13px}}
+th,td{{border:1px solid #ddd;padding:6px 8px;vertical-align:top}}
+th{{background:#f5f5f5;text-align:left}}
+.meta{{color:#666;margin-bottom:16px}}
+</style>
+<h1>{html.escape(repo_id)}</h1>
+<div class="meta">generated_at: {_dt.datetime.now().isoformat(timespec='seconds')} | total_issues: {len(actionable)}</div>
+<h2>Overview</h2>
+<ul>
+<li>problem episodes: {summary['episode_count']}</li>
+<li>unconfirmed: {summary['unconfirmed']}</li>
+<li>by rule: {html.escape(json.dumps(summary['by_rule'], ensure_ascii=False))}</li>
+<li>by field: {html.escape(json.dumps(summary['by_field'], ensure_ascii=False))}</li>
+</ul>
+<p><a href="index.md">Markdown index</a> | <a href="issues.csv">CSV</a> | <a href="issues.json">JSON</a></p>
+<table>
+<thead><tr><th>#</th><th>ep</th><th>rule</th><th>severity</th><th>field</th><th>start(s)</th><th>end(s)</th><th>detail</th><th>clips</th><th>确认状态</th></tr></thead>
+<tbody>{''.join(html_rows) or '<tr><td colspan="10">No actionable issues found.</td></tr>'}</tbody>
+</table>
+</html>
+"""
+    (report_root / "summary.html").write_text(summary_html, encoding="utf-8")
     return str(report_root.resolve())
 
 
@@ -921,7 +1156,10 @@ def save_quality_status(data, path="quality_status.local.json"):
     Path(path).write_text(json.dumps(data or {}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def scan_dataset_with_report(dataset, out_dir="pulls", cfg=None):
-    issues = scan_dataset(dataset, out_dir=out_dir, cfg=cfg)
+def scan_dataset_with_report(dataset, out_dir="pulls", cfg=None, progress=None, cancel=None):
+    issues = scan_dataset(dataset, out_dir=out_dir, cfg=cfg, progress=progress, cancel=cancel)
+    _check_cancel(cancel)
+    _emit(progress, "写入 Markdown/HTML/CSV/JSON 报告...", 97)
     report_dir = write_report(dataset, issues, cfg=cfg)
+    _emit(progress, "深度检查完成。", 100)
     return issues, report_dir
