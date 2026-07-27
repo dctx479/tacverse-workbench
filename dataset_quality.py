@@ -99,6 +99,7 @@ class Issue:
     path: str | None = None
     clip_path: str | None = None
     clip_paths: dict | None = None
+    plot_path: str | None = None  # per-DOF line chart (trajectory issues)
 
 
 def _cfg(cfg):
@@ -796,6 +797,65 @@ def _attach_clips(root, issues, cfg, default_fps, progress=None, cancel=None):
     return issues
 
 
+def _attach_dof_plots(root, issues, episodes, cfg, default_fps):
+    """Render a per-DOF line chart around each trajectory jump.
+
+    The clip shows WHAT happened; this shows WHICH joint did it — one line
+    per state/action dimension over the same window as the clip, with the
+    jump instant marked. Skipped silently when matplotlib is missing."""
+    targets = [x for x in issues
+               if x.rule == "trajectory_jump" and x.episode_index is not None
+               and x.field and x.start_sec is not None]
+    if not targets or not episodes:
+        return issues
+    try:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+    except Exception:
+        return issues
+    plot_root = root / "quality_clips"
+    lead = float(cfg.get("clip_lead_sec", 0.0) or 0.0)
+    for issue in targets:
+        rec = episodes.get(issue.episode_index) or {}
+        seq = sorted(rec.get("columns", {}).get(issue.field) or [], key=lambda x: x[0])
+        if not seq:
+            continue
+        fps = default_fps
+        f_lo = int(max(0.0, issue.start_sec - lead) * fps)
+        f_hi = int(issue.end_sec * fps) + 1
+        window = [(f, v) for f, v in seq if f_lo <= f <= f_hi and v]
+        if len(window) < 3:
+            continue
+        width = min(len(v) for _, v in window)
+        times = [f / fps for f, _ in window]
+        fig, ax = plt.subplots(figsize=(7.2, 3.2), dpi=110)
+        for dim in range(width):
+            ax.plot(times, [v[dim] for _, v in window], lw=1.0, label=f"dof{dim}")
+        if issue.frame_index is not None:
+            ax.axvline(issue.frame_index / fps, color="red", ls="--", lw=1.2)
+        ax.set_xlabel("episode time (s)")
+        ax.set_ylabel(issue.field)
+        # English title: matplotlib's default font has no CJK glyphs.
+        ax.set_title(f"ep{issue.episode_index} {issue.field} jump @ "
+                     f"{(issue.frame_index or 0) / fps:.2f}s", fontsize=10)
+        if width <= 16:
+            ax.legend(fontsize=6, ncol=4, loc="upper right", framealpha=0.6)
+        fig.tight_layout()
+        plot_root.mkdir(parents=True, exist_ok=True)
+        png = plot_root / (
+            f"ep{issue.episode_index:06d}_trajectory_jump_"
+            f"{_safe_name(issue.field)}_{issue.start_sec:.3f}_dof.png")
+        try:
+            fig.savefig(png)
+            issue.plot_path = str(png)
+        except Exception:
+            pass
+        finally:
+            plt.close(fig)
+    return issues
+
+
 def _check_flicker(root, cfg, progress=None, cancel=None):
     try:
         import cv2
@@ -1028,6 +1088,9 @@ def _scan_path_uncached(root, cfg, progress=None, cancel=None):
     _emit(progress, "生成问题视频切片...", 88)
     issues = _attach_clips(root, issues, cfg, default_fps,
                            progress=progress, cancel=cancel)
+    _check_cancel(cancel)
+    _emit(progress, "绘制突变问题的自由度折线图...", 94)
+    issues = _attach_dof_plots(root, issues, episodes, cfg, default_fps)
     max_issues = int(cfg["max_issues"])
     _emit(progress, "检查规则完成。", 95)
     return tuple(issues[:max_issues])
@@ -1070,7 +1133,7 @@ def _issue_line(issue):
     return f"{prefix}: {issue.message}" if prefix else issue.message
 
 
-def _issue_record(issue, clips=None):
+def _issue_record(issue, clips=None, plot=None):
     return {
         "episode": issue.episode_index,
         "rule": issue.rule,
@@ -1082,6 +1145,7 @@ def _issue_record(issue, clips=None):
         "message": issue.message,
         "source": issue.path,
         "clips": clips or {},
+        "plot": plot,
         "review_status": "未确认",
     }
 
@@ -1228,7 +1292,12 @@ def write_report(dataset, issues, cfg=None):
                 # Forward slashes: this relative path lands in <video src>,
                 # where a Windows backslash breaks some browsers' URL parsing.
                 clip_links[camera] = f"{ep_dir.name}/{clip_name}"
-            rec = _issue_record(issue, clip_links)
+            plot_link = None
+            if issue.plot_path and Path(issue.plot_path).is_file():
+                plot_src = Path(issue.plot_path)
+                shutil.copy2(plot_src, ep_dir / plot_src.name)
+                plot_link = f"{ep_dir.name}/{plot_src.name}"
+            rec = _issue_record(issue, clip_links, plot_link)
             rec["issue_id"] = issue_id
             ep_records.append(rec)
             all_records.append(rec)
@@ -1243,6 +1312,8 @@ def write_report(dataset, issues, cfg=None):
             ])
             for clip_name in clip_names:
                 lines.append(f"- clip: {clip_name}")
+            if plot_link:
+                lines.append(f"- dof_plot: {Path(plot_link).name}")
             if issue.path:
                 lines.append(f"- source: {issue.path}")
             lines.append("")
@@ -1264,7 +1335,7 @@ def write_report(dataset, issues, cfg=None):
             fh,
             fieldnames=[
                 "issue_id", "episode", "rule", "severity", "field", "start_sec", "end_sec",
-                "frame", "message", "source", "clips", "review_status",
+                "frame", "message", "source", "clips", "plot", "review_status",
             ])
         writer.writeheader()
         for rec in all_records:
@@ -1281,6 +1352,11 @@ def write_report(dataset, issues, cfg=None):
             clips.append(
                 f'<div><a href="{rel_esc}">{camera_esc}</a><br>'
                 f'<video src="{rel_esc}" controls width="260"></video></div>')
+        if rec.get("plot"):
+            plot_esc = html.escape(rec["plot"])
+            clips.append(
+                f'<div><a href="{plot_esc}">DOF curves</a><br>'
+                f'<img src="{plot_esc}" width="380" loading="lazy"></div>')
         start_text = "" if rec["start_sec"] is None else f"{rec['start_sec']:.3f}"
         end_text = "" if rec["end_sec"] is None else f"{rec['end_sec']:.3f}"
         html_rows.append(
