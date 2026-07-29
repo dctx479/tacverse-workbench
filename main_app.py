@@ -26,11 +26,11 @@ import time
 from pathlib import Path
 
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, QThread, QTimer, Signal, QUrl
+from PySide6.QtCore import QDate, Qt, QPoint, QRect, QSize, QThread, QTimer, Signal, QUrl
 from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
-    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
+    QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QStackedWidget,
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
@@ -466,22 +466,95 @@ class LerobotOpWorker(QThread):
 # --------------------------------------------------------------------------- #
 # Main window
 # --------------------------------------------------------------------------- #
+class FlowLayout(QLayout):
+    """Left-to-right layout that wraps to a new row when it runs out of width
+    (like flowing text). Used for the top toolbar so its minimum width is just
+    its widest single control — the window can shrink to fit small laptops and
+    the controls wrap instead of forcing the window wider (which previously made
+    it snap wider on the first relayout after opening)."""
+
+    def __init__(self, parent=None, margin=0, hspacing=6, vspacing=4):
+        super().__init__(parent)
+        self._items = []
+        self._hspace = hspacing
+        self._vspace = vspacing
+        self.setContentsMargins(margin, margin, margin, margin)
+
+    # Qt plumbing --------------------------------------------------------- #
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientations(Qt.Orientation(0))
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._do_layout(QRect(0, 0, width, 0), test_only=True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._do_layout(rect, test_only=False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    # Core wrapping pass -------------------------------------------------- #
+    def _do_layout(self, rect, test_only):
+        m = self.contentsMargins()
+        x = rect.x() + m.left()
+        y = rect.y() + m.top()
+        right = rect.right() - m.right()
+        line_height = 0
+        for it in self._items:
+            hint = it.sizeHint()
+            next_x = x + hint.width()
+            if next_x - 1 > right and line_height > 0:  # wrap to next row
+                x = rect.x() + m.left()
+                y = y + line_height + self._vspace
+                next_x = x + hint.width()
+                line_height = 0
+            if not test_only:
+                it.setGeometry(QRect(QPoint(x, y), hint))
+            x = next_x + self._hspace
+            line_height = max(line_height, hint.height())
+        return y + line_height + m.bottom() - rect.y()
+
+
+# --------------------------------------------------------------------------- #
 class MainWindow(QWidget):
     def __init__(self):
         super().__init__()
         self.setWindowTitle("TacVerse 多模态物理具身数据集工作台")
         if LOGO_PATH.is_file():
             self.setWindowIcon(QIcon(str(LOGO_PATH)))
-        # Large default for a 2560x1440 display, but kept clearly below the work
-        # area (~82% w / ~85% h) and centred: opening too close to full-screen
-        # makes some window managers auto-maximize the window a moment after it
-        # maps. Start in the normal (non-maximized) state explicitly.
-        target_w, target_h = 2200, 1300
+        # ---- 主窗口默认分辨率（如需再调整，改这里） ----------------------
+        # target_w / target_h 是首选像素尺寸；随后按屏幕「可用区域」(不含任务栏)
+        # 的比例收窄并居中，避免在小屏笔记本上开得过大、预览不全。想改默认大小
+        # 就改 target_w/target_h；想在小屏上留更多余量就调低 0.90 / 0.88 两个系数。
+        target_w, target_h = 1440, 900
         screen = QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
-            target_w = min(target_w, int(avail.width() * 0.82))
-            target_h = min(target_h, int(avail.height() * 0.85))
+            target_w = min(target_w, int(avail.width() * 0.90))
+            target_h = min(target_h, int(avail.height() * 0.88))
         self.setWindowState(Qt.WindowNoState)
         self.resize(target_w, target_h)
         if screen:
@@ -526,10 +599,17 @@ class MainWindow(QWidget):
         self.speed_timer.setInterval(1000)
         self.speed_timer.timeout.connect(self._tick_speed)
 
-        # Trends can render immediately from accumulated history; the 看板
-        # KPI/table stay empty until 统计/拉取.
+        # 看板/表格 default to the LAST pull's results (from committed history) so
+        # they aren't blank on open; a stale banner flags that it's not live, and
+        # 统计/拉取 replaces it with fresh data.
         self.history = dd.load_history(OUT_DIR)
-        self._refresh_trends()
+        last = self.history[-1] if self.history else None
+        if last:
+            self.report = last
+            self._refresh_all()
+            self._show_stale_banner(last)
+        else:
+            self._refresh_trends()
         self.status.setText(
             "就绪：「仅拉取统计信息」(快) / 「下载当前选中数据集」/ 「拉取组织及其下所有数据集」。")
         self._refresh_identity()  # populate the login/visibility indicator
@@ -538,14 +618,13 @@ class MainWindow(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        top = QHBoxLayout()
+        top = FlowLayout(hspacing=6, vspacing=4)
         if LOGO_PATH.is_file():
             logo = QLabel()
             logo.setPixmap(QPixmap(str(LOGO_PATH)).scaledToHeight(
                 30, Qt.SmoothTransformation))
             logo.setToolTip("TacVerse")
             top.addWidget(logo)
-            top.addSpacing(8)
         top.addWidget(QLabel("组织:"))
         self.org_combo = QComboBox()
         self.org_combo.setEditable(True)
@@ -563,11 +642,13 @@ class MainWindow(QWidget):
         self.btn_download = QPushButton("下载当前选中数据集")
         self.btn_pull = QPushButton("拉取组织及其下所有数据集\n（速度较慢）")
         self.btn_check = QPushButton("检查新增数据集")
+        self.btn_manual_stats = QPushButton("手动补录统计")
         self.btn_open = QPushButton("打开本地目录")
         self.btn_stats.clicked.connect(self.on_stats)
         self.btn_download.clicked.connect(self.on_download_selected)
         self.btn_pull.clicked.connect(self.on_pull)
         self.btn_check.clicked.connect(self.on_check)
+        self.btn_manual_stats.clicked.connect(self.on_manual_stats)
         self.btn_open.clicked.connect(self.on_open_dir)
 
         primary_css = (
@@ -591,7 +672,7 @@ class MainWindow(QWidget):
         divider.setFrameShape(QFrame.VLine)
         divider.setFrameShadow(QFrame.Sunken)
         top.addWidget(divider)
-        for b in (self.btn_check, self.btn_open):
+        for b in (self.btn_check, self.btn_manual_stats, self.btn_open):
             b.setStyleSheet(secondary_css)
             top.addWidget(b)
 
@@ -618,14 +699,12 @@ class MainWindow(QWidget):
             b.setStyleSheet(secondary_css)
             top.addWidget(b)
 
-        top.addSpacing(16)
         top.addWidget(QLabel("每日目标(小时):"))
         self.target_spin = QSpinBox()
         self.target_spin.setRange(0, 100000)
         self.target_spin.setValue(10)
         self.target_spin.valueChanged.connect(self._refresh_kpis)
         top.addWidget(self.target_spin)
-        top.addStretch()
         self.btn_account = QPushButton("切换账号")
         self.btn_account.setStyleSheet(secondary_css)
         self.btn_account.clicked.connect(self.on_switch_account)
@@ -699,6 +778,17 @@ class MainWindow(QWidget):
             " border-radius:6px; margin-top:10px; background:#f6f9ff;}"
             "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#1a73e8;}")
         lv = QVBoxLayout(left)
+
+        # Stale-data banner: on open we default to showing the LAST pull's results
+        # (so the 看板/表格 aren't blank), clearly flagged as not live. Hidden once
+        # a fresh 统计/拉取 replaces the data.
+        self.stale_banner = QLabel("")
+        self.stale_banner.setWordWrap(True)
+        self.stale_banner.setVisible(False)
+        self.stale_banner.setStyleSheet(
+            "background:#fff3cd; color:#8a6d3b; border:1px solid #ffe69c;"
+            " border-radius:6px; padding:6px 10px; font-weight:bold;")
+        lv.addWidget(self.stale_banner)
 
         # 数据集总览 (KPI cards, 4 per row)
         self.kpi_labels = {}
@@ -975,6 +1065,11 @@ class MainWindow(QWidget):
         row.addWidget(self.dim_combo)
         row.addStretch()
         v.addLayout(row)
+
+        self.rollup_hint = QLabel("")
+        self.rollup_hint.setStyleSheet("color:#888; font-size:12px;")
+        self.rollup_hint.setWordWrap(True)
+        v.addWidget(self.rollup_hint)
 
         self.rollup_table = QTableWidget(0, 5)
         self.rollup_table.setHorizontalHeaderLabels(
@@ -1734,6 +1829,25 @@ class MainWindow(QWidget):
         self._refresh_trends()
         self._refresh_rollup()
 
+    def _show_stale_banner(self, snap):
+        """Flag that the 看板/表格 currently show a past pull, not live data."""
+        if snap.get("source") == "manual":
+            self.stale_banner.setText(
+                f"ℹ️ 当前显示 {fmt_day(snap.get('date'))} 手动补录的总统计。"
+                "该快照不含逐数据集明细；今日新增按前一个有记录日期的累计值推导。")
+            self.stale_banner.setVisible(True)
+            return
+        at = (snap.get("pulled_at") or "").replace("T", " ")
+        when = f"（{at}）" if at else ""
+        self.stale_banner.setText(
+            f"⚠️ 当前显示的是上一次拉取结果{when}，并非实时最新。"
+            "点「仅拉取统计信息」刷新为最新数据。")
+        self.stale_banner.setVisible(True)
+
+    def _hide_stale_banner(self):
+        """Data is now live (a fresh 统计/拉取 just finished) — drop the flag."""
+        self.stale_banner.setVisible(False)
+
     def _current_deltas(self):
         if not self.report:
             return {}
@@ -1783,12 +1897,8 @@ class MainWindow(QWidget):
         all zero — fall back to the difference of the aggregate totals so 今日新增
         is still correct."""
         base = dd.find_baseline(self.report, self.history) if self.report else None
-        if base and not base.get("datasets"):
-            nh = round((self.report.get("total_hours") or 0)
-                       - (base.get("total_hours") or 0), 2)
-            ne = (self.report.get("total_episodes") or 0) \
-                - (base.get("total_episodes") or 0)
-            return nh, ne
+        if not self.report.get("datasets") or (base and not base.get("datasets")):
+            return dd.aggregate_deltas(self.report, self.history)
         nh = round(sum(d["d_hours"] for d in deltas.values()), 2)
         ne = sum(d["d_episodes"] for d in deltas.values())
         return nh, ne
@@ -1799,6 +1909,11 @@ class MainWindow(QWidget):
         Attributes each dataset's 今日新增 (delta) to its uploader's Chinese name,
         then picks the top by hours. Shows their hours + episodes underneath.
         """
+        if self.report and not self.report.get("datasets") \
+                and (self.report.get("total_datasets") or 0) > 0:
+            self.mvp_name_lbl.setText("—")
+            self.mvp_sub_lbl.setText("无逐数据集贡献信息，无法计算")
+            return
         by_person = {}
         for d in (self.report.get("datasets", []) if self.report else []):
             dv = deltas.get(d["dataset_name"], {})
@@ -1900,7 +2015,10 @@ class MainWindow(QWidget):
             self._refresh_merge_list()
         self.table_hint.setText(
             f"共 {len(datasets)} 个数据集，双击行打开 HF 页面；点表头排序。"
-            if datasets else "点「仅拉取统计信息」加载数据集列表。")
+            if datasets else (
+                "该快照仅包含手动总量，不含逐数据集明细。"
+                if r and r.get("source") == "manual" else
+                "点「仅拉取统计信息」加载数据集列表。"))
         self._apply_filter()
 
     def _apply_filter(self):
@@ -2283,7 +2401,12 @@ class MainWindow(QWidget):
     def _refresh_rollup(self):
         self.rollup_table.setRowCount(0)
         self.rollup_plot.clear()
+        self.rollup_hint.setText("")
         if not self.report:
+            return
+        if self.report.get("source") == "manual":
+            self.rollup_hint.setText("该手动快照仅包含总量，无法生成分组统计。")
+            self.rollup_plot.setTitle("各分组小时数")
             return
         dim = self.dim_combo.currentText()
         rows = dd.rollup(self.report.get("datasets", []), ROLLUP_DIMS[dim])
@@ -2434,7 +2557,7 @@ class MainWindow(QWidget):
     # ---- Button handlers -------------------------------------------------- #
     def _set_busy(self, busy):
         for b in (self.btn_pull, self.btn_stats, self.btn_download,
-                  self.btn_check, self.btn_open):
+                  self.btn_check, self.btn_manual_stats, self.btn_open):
             b.setEnabled(not busy)
         # Edit-tab actions share the busy lock so a copy/push can't overlap a pull.
         if hasattr(self, "btn_make_copy"):
@@ -2508,6 +2631,95 @@ class MainWindow(QWidget):
         self.worker.error.connect(self._on_error)
         self.worker.start()
 
+    def on_manual_stats(self):
+        """Add an aggregate-only historical snapshot from another computer."""
+        from PySide6.QtWidgets import (
+            QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout,
+        )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("手动补录总统计")
+        dlg.setMinimumWidth(430)
+        form = QFormLayout(dlg)
+
+        date_edit = QDateEdit(QDate.currentDate())
+        date_edit.setCalendarPopup(True)
+        date_edit.setDisplayFormat("yyyy-MM-dd")
+        date_edit.setMaximumDate(QDate.currentDate())
+        org_edit = QLineEdit(self.org_combo.currentText().strip())
+
+        def int_spin():
+            spin = QSpinBox()
+            spin.setRange(0, 2_000_000_000)
+            spin.setGroupSeparatorShown(True)
+            return spin
+
+        datasets_spin = int_spin()
+        episodes_spin = int_spin()
+        frames_spin = int_spin()
+        hours_spin = QDoubleSpinBox()
+        hours_spin.setRange(0, 1_000_000_000)
+        hours_spin.setDecimals(3)
+        hours_spin.setSingleStep(0.1)
+        hours_spin.setGroupSeparatorShown(True)
+
+        form.addRow("统计日期:", date_edit)
+        form.addRow("组织:", org_edit)
+        form.addRow("数据集总数:", datasets_spin)
+        form.addRow("总 episodes:", episodes_spin)
+        form.addRow("总 frames:", frames_spin)
+        form.addRow("总小时数:", hours_spin)
+        hint = QLabel(
+            "仅保存累计总量；今日新增会与前一个有记录日期自动比较。"
+            "该快照不包含数据集表格、分组和 MVP 明细。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#888; font-size:12px;")
+        form.addRow(hint)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        org = org_edit.text().strip()
+        if not org:
+            QMessageBox.warning(self, "提示", "组织不能为空。")
+            return
+        day = date_edit.date()
+        date = day.toString("yyMMdd")
+        previous_report = self.report
+        previous_was_live = bool(previous_report) and not self.stale_banner.isVisible()
+        try:
+            manual_report = dd.upsert_manual_totals(
+                date=date,
+                org=org,
+                total_datasets=datasets_spin.value(),
+                total_episodes=episodes_spin.value(),
+                total_frames=frames_spin.value(),
+                total_hours=hours_spin.value(),
+            )
+        except (OSError, ValueError) as exc:
+            QMessageBox.critical(self, "补录失败", str(exc))
+            return
+
+        self.history = dd.load_history(OUT_DIR)
+        self.report = self.history[-1] if self.history else None
+        self._refresh_all()
+        if self.report:
+            if self.report.get("source") == "manual":
+                self._show_stale_banner(self.report)
+            elif previous_was_live and previous_report \
+                    and (previous_report.get("pulled_at") or "") \
+                    >= (manual_report.get("pulled_at") or ""):
+                self._hide_stale_banner()
+            else:
+                self._show_stale_banner(self.report)
+        self.status.setText(
+            f"已补录 {day.toString('yyyy-MM-dd')} {org} 的总统计；"
+            "今日新增按前一个记录日自动计算。")
+
     def _on_progress(self, done, total):
         self.bar.setMaximum(max(total, 1))
         self.bar.setValue(done)
@@ -2535,6 +2747,7 @@ class MainWindow(QWidget):
         self.report = report
         self.history = dd.load_history(OUT_DIR)  # new snapshot just written
         self._refresh_all()
+        self._hide_stale_banner()  # data is now live
         self._set_busy(False)
         fails = len(report.get("failures", []))
         msg = f"拉取完成: {report['count']}/{report['requested']} 个数据集"
@@ -2550,11 +2763,12 @@ class MainWindow(QWidget):
         # that were only 统计'd never showed up.
         hist_note = ""
         try:
-            dd.append_history(report)
+            dd.append_pull(report)
             self.history = dd.load_history(OUT_DIR)
         except OSError as exc:
             hist_note = f"（历史未写入: {exc}）"
         self._refresh_all()
+        self._hide_stale_banner()  # data is now live
         self._set_busy(False)
         fails = len(report.get("failures", []))
         msg = f"统计完成: {report['count']}/{report['requested']} 个数据集，共 {report['total_hours']} 小时"

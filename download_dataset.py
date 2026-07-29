@@ -283,10 +283,10 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
         out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log(f"Wrote summary -> {out_path}")
     try:
-        append_history(report)  # git-committed history; survives pulls/ being ignored
-        log(f"Updated history -> {CONFIG_FILE}")
+        append_pull(report)  # git-committed change-log; survives pulls/ being ignored
+        log(f"Updated history -> {DATASET_LOG_FILE}")
     except OSError as exc:
-        log(f"WARN: could not update {CONFIG_FILE}: {exc}")
+        log(f"WARN: could not update {DATASET_LOG_FILE}: {exc}")
     return report, out_path
 
 
@@ -335,20 +335,30 @@ def find_latest_report(out_dir):
 # --------------------------------------------------------------------------- #
 # Analytics helpers (pure functions over report dicts — used by the GUI)
 # --------------------------------------------------------------------------- #
-# Single git-committed config file at the repo root. Holds BOTH the hand-edited
-# uploader id->name map AND the auto-appended pull history, so the project keeps
-# only one json to maintain. It travels with the code — a fresh clone gets the
-# collection trend / 每日新增 WITHOUT syncing the multi-GB pulls/ folder (ignored).
+# Two git-committed json files at the repo root, both travelling with the code so
+# a fresh clone gets the collection trend / 每日新增 WITHOUT syncing the multi-GB
+# pulls/ folder (which is .gitignore'd):
 #
-#   { "uploader_names": { "<hf_id>": "<中文名>", ... },   # you edit this
-#     "pull_history":  [ {trimmed pull snapshot}, ... ] }  # the app appends this
+#   config.json       — hand-edited only:
+#                        { "checks": {...}, "uploader_names": {"<hf_id>": "<中文名>"} }
+#   dataset_log.json  — auto-appended per-DATASET change log (no time-major dupes):
+#     { "dataset_index": [ "<name>", ... ],                     # names stored once
+#       "daily_totals": [ {pulled_at,date,org,total_*,present:[idx],
+#                            source?:"manual"} ],  # 1 row/pull/manual snapshot
+#       "datasets": { "<name>": { <meta>, "changes": [ {date,pulled_at,
+#                                total_*,d_*} ] } } }  # a row ONLY when totals moved
 CONFIG_FILE = str(Path(__file__).parent / "config.json")
+DATASET_LOG_FILE = str(Path(__file__).parent / "dataset_log.json")
 
-# Per-dataset fields kept in the lightweight history (drop link/local_dir paths).
+# Per-dataset fields exposed to the GUI in a reconstructed snapshot row.
 _HISTORY_DS_FIELDS = (
     "dataset_name", "total_episodes", "total_frames", "duration_hours",
     "fps", "robot_type", "total_tasks", "uploader", "last_modified",
 )
+# Slow-changing metadata stored once per dataset (latest value wins).
+_DS_META_FIELDS = ("fps", "robot_type", "total_tasks", "uploader", "last_modified")
+# Cumulative totals whose movement triggers a new `changes` entry.
+_DS_TOTAL_FIELDS = ("total_episodes", "total_frames", "duration_hours")
 
 
 def load_config(path=CONFIG_FILE):
@@ -365,58 +375,409 @@ def load_uploader_names(path=CONFIG_FILE):
     return load_config(path).get("uploader_names", {}) or {}
 
 
-def _trim_report(report):
-    """A compact, path-free copy of a report for the history in the config file."""
-    return {
-        "pulled_at": report.get("pulled_at"),
+# --------------------------------------------------------------------------- #
+# Dataset change-log (dataset_log.json) — read / append / reconstruct
+# --------------------------------------------------------------------------- #
+def load_dataset_log(path=DATASET_LOG_FILE):
+    """Read the dataset change-log; returns an empty skeleton on missing/corrupt."""
+    try:
+        log = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        log = None
+    if not isinstance(log, dict):
+        log = {}
+    log.setdefault("dataset_index", [])
+    log.setdefault("daily_totals", [])
+    log.setdefault("datasets", {})
+    return log
+
+
+def _dataset_log_text(log, present_per_line=16):
+    """Serialize the change-log in a compact but still reviewable layout.
+
+    Normal ``json.dumps(..., indent=2)`` places every integer on its own line,
+    and expands every small dataset/change object across many lines.  Keep the
+    top-level collections readable, group ``present`` indices, render each
+    change object on one line, and render each dataset's metadata on one line.
+    The result remains plain JSON and round-trips through any standard parser.
+    """
+    def compact(value):
+        return json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
+
+    def append_regular_property(lines, key, value, trailing_comma):
+        dumped = json.dumps(value, indent=2, ensure_ascii=False).splitlines()
+        key_text = json.dumps(key, ensure_ascii=False)
+        if len(dumped) == 1:
+            lines.append(f"  {key_text}: {dumped[0]}" + ("," if trailing_comma else ""))
+            return
+        lines.append(f"  {key_text}: {dumped[0]}")
+        lines.extend("  " + line for line in dumped[1:-1])
+        lines.append("  " + dumped[-1] + ("," if trailing_comma else ""))
+
+    def append_datasets(lines, datasets, trailing_comma):
+        lines.append('  "datasets": {')
+        items = list(datasets.items())
+        for dataset_i, (name, section) in enumerate(items):
+            dataset_comma = dataset_i < len(items) - 1
+            lines.append(f"    {json.dumps(name, ensure_ascii=False)}: {{")
+            changes = section.get("changes", []) or []
+            metadata = [(key, value) for key, value in section.items()
+                        if key != "changes"]
+            if changes:
+                lines.append('      "changes": [')
+                for change_i, change in enumerate(changes):
+                    if change_i < len(changes) - 1:
+                        suffix = ","
+                    else:
+                        suffix = "]" + ("," if metadata else "")
+                    lines.append("        " + compact(change) + suffix)
+            else:
+                lines.append('      "changes": []' + ("," if metadata else ""))
+
+            if metadata:
+                meta_text = ", ".join(
+                    f"{json.dumps(key, ensure_ascii=False)}: {compact(value)}"
+                    for key, value in metadata)
+                lines.append("      " + meta_text + "}" + ("," if dataset_comma else ""))
+            else:
+                lines.append("    }" + ("," if dataset_comma else ""))
+        lines.append("  }" + ("," if trailing_comma else ""))
+
+    lines = ["{"]
+    properties = list(log.items())
+    for prop_i, (key, value) in enumerate(properties):
+        trailing_comma = prop_i < len(properties) - 1
+        if key == "datasets" and isinstance(value, dict):
+            append_datasets(lines, value, trailing_comma)
+        else:
+            append_regular_property(lines, key, value, trailing_comma)
+    lines.append("}")
+
+    # Compact only the already-rendered multi-line present arrays; empty arrays
+    # stay as ``[]`` and all other arrays retain their dedicated layouts above.
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() != '"present": [':
+            out.append(line)
+            i += 1
+            continue
+
+        values = []
+        j = i + 1
+        while j < len(lines) and lines[j].strip() not in ("]", "],"):
+            values.append(lines[j].strip().rstrip(","))
+            j += 1
+        if not values or j >= len(lines):
+            out.append(line)
+            i += 1
+            continue
+
+        out.append(line)
+        value_indent = line[:len(line) - len(line.lstrip())] + "  "
+        for start in range(0, len(values), present_per_line):
+            chunk = values[start:start + present_per_line]
+            suffix = "," if start + present_per_line < len(values) else ""
+            out.append(value_indent + ", ".join(chunk) + suffix)
+        out.append(lines[j])
+        i = j + 1
+    return "\n".join(out) + "\n"
+
+
+def write_dataset_log(log, path=DATASET_LOG_FILE):
+    """Write ``log`` using the repository's readable compact JSON format."""
+    Path(path).write_text(_dataset_log_text(log), encoding="utf-8")
+    return path
+
+
+def _fold_report_into_log(log, report):
+    """Merge one report into `log` in place. Appends the per-pull aggregate row
+    and, per dataset, a change entry ONLY when its totals moved — recording both
+    the resulting totals and the +delta vs the previous entry.
+
+    Dataset names are stored once in the shared `dataset_index`; each daily_totals
+    row lists the datasets present at that pull as integer indices into it
+    (`present`), so names aren't re-listed in full on every pull. Reports must be
+    folded oldest-first so deltas chain correctly."""
+    at = report.get("pulled_at")
+    date = report.get("date")
+    org = report.get("org")
+    totals = log.setdefault("daily_totals", [])
+
+    # One authoritative snapshot per organisation and calendar day.  Ignore an
+    # out-of-order older report instead of allowing it to replace newer data.
+    same_day = [t for t in totals
+                if t.get("date") == date and t.get("org") == org]
+    if same_day and max((t.get("pulled_at") or "") for t in same_day) > (at or ""):
+        return log
+
+    # Remove the earlier aggregate row and its per-dataset changes before
+    # calculating this pull's deltas.  The remaining previous change is then
+    # from an earlier day, so d_* represents the whole day's growth.
+    totals[:] = [t for t in totals
+                 if not (t.get("date") == date and t.get("org") == org)]
+    report_names = {d.get("dataset_name") for d in report.get("datasets", [])
+                    if d.get("dataset_name")}
+    prefix = f"{org}/" if org else None
+    for name, sect in log.setdefault("datasets", {}).items():
+        if name not in report_names and not (prefix and name.startswith(prefix)):
+            continue
+        changes = sect.setdefault("changes", [])
+        changes[:] = [c for c in changes if c.get("date") != date]
+
+    index = log.setdefault("dataset_index", [])
+    pos = {n: i for i, n in enumerate(index)}
+    dsets = log.setdefault("datasets", {})
+
+    present = []
+    for d in report.get("datasets", []):
+        name = d.get("dataset_name")
+        if not name:
+            continue
+        if name not in pos:                    # register the name once
+            pos[name] = len(index)
+            index.append(name)
+        present.append(pos[name])              # present even if unchanged below
+        sect = dsets.setdefault(name, {"changes": []})
+        for k in _DS_META_FIELDS:              # keep newest slow-changing metadata
+            sect[k] = d.get(k)
+        changes = sect.setdefault("changes", [])
+        changes[:] = [c for c in changes if c.get("pulled_at") != at]  # idempotent
+        cur = {k: d.get(k) for k in _DS_TOTAL_FIELDS}
+        prev = changes[-1] if changes else None
+        if prev and all(prev.get(k) == cur.get(k) for k in _DS_TOTAL_FIELDS):
+            continue                            # unchanged -> write no change row
+        base = prev or {}
+        changes.append({
+            "date": report.get("date"), "pulled_at": at, **cur,
+            "d_episodes": (cur.get("total_episodes") or 0) - (base.get("total_episodes") or 0),
+            "d_frames": (cur.get("total_frames") or 0) - (base.get("total_frames") or 0),
+            "d_hours": round((cur.get("duration_hours") or 0) - (base.get("duration_hours") or 0), 3),
+        })
+
+    row = {
+        "pulled_at": at,
         "date": report.get("date"),
         "org": report.get("org"),
         "total_datasets": report.get("total_datasets"),
         "total_episodes": report.get("total_episodes"),
         "total_frames": report.get("total_frames"),
         "total_hours": report.get("total_hours"),
-        "datasets": [{k: d.get(k) for k in _HISTORY_DS_FIELDS}
-                     for d in report.get("datasets", [])],
+        "present": sorted(present),
     }
+    if report.get("source"):
+        row["source"] = report["source"]
+    totals.append(row)
+    totals.sort(key=lambda t: t.get("pulled_at") or "")
+    return log
 
 
-def append_history(report, path=CONFIG_FILE):
-    """Fold a trimmed snapshot of `report` into config["pull_history"].
+def append_pull(report, path=DATASET_LOG_FILE):
+    """Fold `report` into the git-committed dataset change-log at `path`.
 
-    Re-reads the file first so the hand-edited uploader_names (and any other
-    keys) are preserved. Dedupes by pulled_at and keeps history oldest-first.
+    Unchanged datasets are NOT re-stored on every pull (unlike the old
+    pull_history), so the file stays small. Re-reads first; safe to re-run.
+    Returns the path written.
     """
-    cfg = load_config(path)
-    hist = cfg.get("pull_history", []) or []
-    snap = _trim_report(report)
-    hist = [h for h in hist if h.get("pulled_at") != snap.get("pulled_at")]
-    hist.append(snap)
-    hist.sort(key=lambda r: r.get("pulled_at") or "")
-    cfg["pull_history"] = hist
-    cfg.setdefault("uploader_names", {})  # keep the section present for editors
-    Path(path).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
-    return path
+    log = load_dataset_log(path)
+    # A real stats/pull on the same day supersedes an aggregate-only manual
+    # placeholder.  This prevents the synthetic 23:59:59 manual timestamp from
+    # continuing to win after fresh detailed data becomes available.
+    totals = log.setdefault("daily_totals", [])
+    totals[:] = [t for t in totals if not (
+        t.get("source") == "manual"
+        and t.get("date") == report.get("date")
+        and t.get("org") == report.get("org")
+    )]
+    _fold_report_into_log(log, report)
+    return write_dataset_log(log, path)
 
 
-def load_history(out_dir, config_file=CONFIG_FILE):
+def upsert_manual_totals(date, org, total_datasets, total_episodes,
+                         total_frames, total_hours, path=DATASET_LOG_FILE,
+                         today=None):
+    """Insert or replace one aggregate-only manual snapshot.
+
+    ``date`` uses the same YYMMDD format as regular reports.  The synthetic
+    end-of-day timestamp makes the manual snapshot authoritative for that day;
+    :func:`append_pull` removes it if real detailed statistics are later pulled
+    for the same organisation and date.
+    """
+    try:
+        day = dt.datetime.strptime(date, "%y%m%d").date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("date must use YYMMDD format") from exc
+    today = today or dt.date.today()
+    if day > today:
+        raise ValueError("manual snapshot date cannot be in the future")
+    if not isinstance(org, str) or not org.strip():
+        raise ValueError("org cannot be empty")
+
+    integer_fields = {
+        "total_datasets": total_datasets,
+        "total_episodes": total_episodes,
+        "total_frames": total_frames,
+    }
+    normalized = {}
+    for key, value in integer_fields.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer")
+        normalized[key] = value
+    if isinstance(total_hours, bool) or not isinstance(total_hours, (int, float)) \
+            or total_hours < 0:
+        raise ValueError("total_hours must be a non-negative number")
+
+    report = {
+        "pulled_at": day.strftime("%Y-%m-%dT23:59:59"),
+        "date": date,
+        "org": org.strip(),
+        **normalized,
+        "total_hours": round(float(total_hours), 3),
+        "datasets": [],
+        "source": "manual",
+    }
+    log = load_dataset_log(path)
+    totals = log.setdefault("daily_totals", [])
+    totals[:] = [t for t in totals if not (
+        t.get("source") == "manual"
+        and t.get("date") == date
+        and t.get("org") == report["org"]
+    )]
+    _fold_report_into_log(log, report)
+    write_dataset_log(log, path)
+    return report
+
+
+def _state_as_of(log, pulled_at, names):
+    """Per-dataset snapshot rows for `names` as they stood at `pulled_at`.
+
+    For each name, take the last change entry with pulled_at <= the target and
+    merge in the dataset's metadata, rebuilding a row shaped like the old
+    pull_history datasets[] entries (_HISTORY_DS_FIELDS)."""
+    dsets = log.get("datasets", {})
+    target = pulled_at or ""
+    rows = []
+    for name in names:
+        sect = dsets.get(name)
+        if not sect:
+            continue
+        latest = None
+        for c in sect.get("changes", []):
+            if (c.get("pulled_at") or "") <= target:
+                latest = c
+        if latest is None:
+            continue
+        row = {"dataset_name": name}
+        for k in _DS_TOTAL_FIELDS:
+            row[k] = latest.get(k)
+        for k in _DS_META_FIELDS:
+            row[k] = sect.get(k)
+        rows.append(row)
+    return rows
+
+
+def _reconstruct_history(log):
+    """Rebuild the oldest-first list of full pull snapshots from the change-log,
+    equivalent to the old config['pull_history'] shape so downstream analytics
+    (daily_series / find_baseline / compute_deltas) need no changes."""
+    index = log.get("dataset_index", [])
+    snaps = []
+    for row in sorted(log.get("daily_totals", []),
+                      key=lambda t: t.get("pulled_at") or ""):
+        names = [index[i] for i in row.get("present", []) if 0 <= i < len(index)]
+        snap = {k: row.get(k) for k in
+                ("pulled_at", "date", "org", "total_datasets",
+                 "total_episodes", "total_frames", "total_hours")}
+        if row.get("source"):
+            snap["source"] = row["source"]
+        snap["datasets"] = _state_as_of(log, row.get("pulled_at"), names)
+        snaps.append(snap)
+    return snaps
+
+
+def compact_dataset_log(path=DATASET_LOG_FILE):
+    """Rewrite an existing log with only its latest rows per calendar day.
+
+    The cleanup is deliberately in-place: dataset metadata and orphaned index
+    entries are retained, while aggregate rows and each dataset's change rows
+    are collapsed independently.  Deltas are then recomputed against the prior
+    retained day.
+    """
+    log = load_dataset_log(path)
+    before = len(log.get("daily_totals", []))
+    latest = {}
+    for row in log.get("daily_totals", []):
+        key = (row.get("date") or row.get("pulled_at"), row.get("org"))
+        previous = latest.get(key)
+        if previous is None or (row.get("pulled_at") or "") \
+                >= (previous.get("pulled_at") or ""):
+            latest[key] = row
+    log["daily_totals"] = sorted(
+        latest.values(), key=lambda r: r.get("pulled_at") or "")
+
+    for sect in log.get("datasets", {}).values():
+        by_day = {}
+        for change in sect.get("changes", []):
+            key = change.get("date") or change.get("pulled_at")
+            previous = by_day.get(key)
+            if previous is None or (change.get("pulled_at") or "") \
+                    >= (previous.get("pulled_at") or ""):
+                by_day[key] = change
+        changes = sorted(by_day.values(), key=lambda c: c.get("pulled_at") or "")
+        previous = None
+        for change in changes:
+            base = previous or {}
+            change["d_episodes"] = ((change.get("total_episodes") or 0)
+                                     - (base.get("total_episodes") or 0))
+            change["d_frames"] = ((change.get("total_frames") or 0)
+                                   - (base.get("total_frames") or 0))
+            change["d_hours"] = round(
+                (change.get("duration_hours") or 0)
+                - (base.get("duration_hours") or 0), 3)
+            previous = change
+        sect["changes"] = changes
+
+    write_dataset_log(log, path)
+    return before, len(log["daily_totals"])
+
+
+def load_history(out_dir, log_file=DATASET_LOG_FILE):
     """Load pull snapshots oldest-first for trends / deltas.
 
-    Merges config["pull_history"] (committed) with any local
-    pulls/*/pull_result_*.json still on disk, deduping by pulled_at so both
-    sources contribute but neither double-counts.
+    Reconstructs the committed snapshots from the dataset change-log and merges
+    them with any local pulls/*/pull_result_*.json still on disk, deduping by
+    pulled_at so both sources contribute but neither double-counts.
     """
     by_at = {}
-    for r in load_config(config_file).get("pull_history", []) or []:
-        by_at[r.get("pulled_at") or id(r)] = r
+    for r in _reconstruct_history(load_dataset_log(log_file)):
+        key = (r.get("pulled_at") or id(r), r.get("org"))
+        by_at[key] = r
     for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
         try:
             r = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        by_at.setdefault(r.get("pulled_at") or str(f), r)  # config wins on ties
+        key = (r.get("pulled_at") or str(f), r.get("org"))
+        by_at.setdefault(key, r)  # log wins on ties
     history = list(by_at.values())
     history.sort(key=lambda r: r.get("pulled_at", ""))
     return history
+
+
+def migrate_pull_history_to_log(config_path=CONFIG_FILE, log_path=DATASET_LOG_FILE):
+    """One-time: convert config['pull_history'] into dataset_log.json, then drop
+    the pull_history key from config (keeping checks + uploader_names). Rebuilds
+    the log from scratch out of config's history, so it is safe to re-run."""
+    cfg = load_config(config_path)
+    hist = cfg.get("pull_history", []) or []
+    log = {"dataset_index": [], "daily_totals": [], "datasets": {}}
+    for snap in sorted(hist, key=lambda r: r.get("pulled_at") or ""):
+        _fold_report_into_log(log, snap)
+    write_dataset_log(log, log_path)
+    cfg.pop("pull_history", None)
+    Path(config_path).write_text(json.dumps(cfg, indent=2, ensure_ascii=False) + "\n")
+    return log_path
 
 
 def daily_series(history):
@@ -466,6 +827,16 @@ def find_baseline(current_report, history):
         if rd and rd < cur_date:
             prior = r
     return prior
+
+
+def aggregate_deltas(current_report, history):
+    """Return aggregate (new_hours, new_episodes) vs the prior recorded day."""
+    base = find_baseline(current_report, history)
+    base_hours = (base.get("total_hours") or 0) if base else 0
+    base_eps = (base.get("total_episodes") or 0) if base else 0
+    new_hours = round((current_report.get("total_hours") or 0) - base_hours, 2)
+    new_episodes = (current_report.get("total_episodes") or 0) - base_eps
+    return new_hours, new_episodes
 
 
 def compute_deltas(current_report, history):
@@ -566,7 +937,18 @@ def main() -> int:
         action="store_true",
         help="Download only; skip writing the summary file",
     )
+    parser.add_argument(
+        "--migrate-log",
+        action="store_true",
+        help="One-time: convert config.json's legacy pull_history into "
+             "dataset_log.json and drop pull_history from config.json, then exit",
+    )
     args = parser.parse_args()
+
+    if args.migrate_log:
+        path = migrate_pull_history_to_log()
+        print(f"Migrated pull_history -> {path}; removed pull_history from {CONFIG_FILE}")
+        return 0
 
     normalize_proxy_env()
 
