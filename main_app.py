@@ -49,7 +49,9 @@ _configure_qt_plugin_path()
 
 import pyqtgraph as pg
 from PySide6.QtCore import QDate, Qt, QThread, QTimer, Signal, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import (
+    QBrush, QColor, QDesktopServices, QFontDatabase, QIcon, QPalette, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QDateEdit, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit, QListWidget,
@@ -73,6 +75,159 @@ OUT_DIR = "pulls"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"  # logos / image assets
 LOGO_PATH = ASSETS_DIR / "logo.png"
 RECENT_ORGS = ["TacVerse", "Xense"]  # seeds the editable org combo
+
+# Keep the widget palette independent from the host desktop theme.  Mixing
+# Windows' native dark/light palette with light, per-widget QSS made some text
+# unreadable, while Ubuntu and Windows also gave the same controls different
+# padding and heights.  Fusion plus this palette is intentionally shared by
+# every platform; platform-specific font fallback is handled below.
+UI_COLORS = {
+    "window": "#F3F5F7",
+    "surface": "#FFFFFF",
+    "surface_alt": "#F7F9FC",
+    "border": "#D0D5DD",
+    "border_strong": "#B8C0CC",
+    "text": "#1D2939",
+    "text_muted": "#667085",
+    "text_disabled": "#98A2B3",
+    "blue": "#2563EB",
+    "blue_hover": "#1D4ED8",
+    "green": "#238636",
+    "green_hover": "#1A7F37",
+    "amber": "#D97706",
+    "amber_hover": "#B45309",
+    "red": "#C62828",
+}
+
+MUTED_TEXT_STYLE = f"color:{UI_COLORS['text_muted']}; font-size:9pt;"
+BLUE_PANEL_STYLE = (
+    "QGroupBox{font-weight:bold; border:1px solid #9EC5FE;"
+    " border-radius:6px; margin-top:10px; background:#F6F9FF;}"
+    "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#175CD3;}"
+)
+GREEN_PANEL_STYLE = (
+    "QGroupBox{font-weight:bold; border:1px solid #A3D9A5;"
+    " border-radius:6px; margin-top:10px; background:#F4FAF4;}"
+    "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#237A36;}"
+)
+
+
+def configure_application_ui(app):
+    """Apply a predictable light theme and a CJK-capable platform font."""
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(UI_COLORS["window"]))
+    palette.setColor(QPalette.WindowText, QColor(UI_COLORS["text"]))
+    palette.setColor(QPalette.Base, QColor(UI_COLORS["surface"]))
+    palette.setColor(QPalette.AlternateBase, QColor(UI_COLORS["surface_alt"]))
+    palette.setColor(QPalette.ToolTipBase, QColor("#101828"))
+    palette.setColor(QPalette.ToolTipText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.Text, QColor(UI_COLORS["text"]))
+    palette.setColor(QPalette.Button, QColor(UI_COLORS["surface"]))
+    palette.setColor(QPalette.ButtonText, QColor(UI_COLORS["text"]))
+    palette.setColor(QPalette.BrightText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.Link, QColor(UI_COLORS["blue"]))
+    palette.setColor(QPalette.Highlight, QColor(UI_COLORS["blue"]))
+    palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.PlaceholderText, QColor(UI_COLORS["text_disabled"]))
+    palette.setColor(
+        QPalette.Disabled, QPalette.Text, QColor(UI_COLORS["text_disabled"]))
+    palette.setColor(
+        QPalette.Disabled, QPalette.ButtonText, QColor(UI_COLORS["text_disabled"]))
+    app.setPalette(palette)
+
+    if sys.platform == "win32":
+        family = "Microsoft YaHei UI"
+    elif sys.platform == "darwin":
+        family = "PingFang SC"
+    else:
+        family = "Noto Sans CJK SC"
+    font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
+    # Qt will gracefully fall back when a distribution does not ship the
+    # preferred CJK family; avoiding a font-database scan also keeps headless
+    # Windows/offscreen runs free of a misleading bundled-font warning.
+    font.setFamily(family)
+    font.setPointSize(10)
+    app.setFont(font)
+
+    # Pixel dimensions here are logical Qt pixels and therefore follow the OS
+    # scale factor.  A single stylesheet also prevents native Windows metrics
+    # from making controls taller than their Ubuntu counterparts.
+    app.setStyleSheet(f"""
+        QWidget {{ color: {UI_COLORS['text']}; }}
+        QToolTip {{
+            color: #FFFFFF; background: #101828; border: 1px solid #344054;
+            padding: 4px 6px;
+        }}
+        QPushButton {{
+            min-height: 28px; padding: 3px 10px;
+            background: {UI_COLORS['surface']};
+            border: 1px solid {UI_COLORS['border_strong']}; border-radius: 5px;
+        }}
+        QPushButton:hover {{ background: #F2F4F7; border-color: #98A2B3; }}
+        QPushButton:pressed {{ background: #EAECF0; }}
+        QPushButton:disabled {{
+            color: {UI_COLORS['text_disabled']}; background: #F2F4F7;
+            border-color: {UI_COLORS['border']};
+        }}
+        QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {{
+            min-height: 28px; padding: 2px 7px;
+            color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
+            border: 1px solid {UI_COLORS['border_strong']}; border-radius: 4px;
+            selection-background-color: {UI_COLORS['blue']};
+            selection-color: #FFFFFF;
+        }}
+        QLineEdit:focus, QComboBox:focus, QSpinBox:focus,
+        QDoubleSpinBox:focus, QDateEdit:focus {{ border-color: {UI_COLORS['blue']}; }}
+        QComboBox QAbstractItemView {{
+            color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
+            border: 1px solid {UI_COLORS['border_strong']};
+            selection-background-color: {UI_COLORS['blue']};
+            selection-color: #FFFFFF;
+        }}
+        QTabWidget::pane {{
+            background: {UI_COLORS['surface']};
+            border: 1px solid {UI_COLORS['border']}; border-radius: 4px;
+        }}
+        QTabBar::tab {{
+            min-height: 30px; padding: 4px 14px;
+            color: {UI_COLORS['text_muted']}; background: #EAECF0;
+            border: 1px solid {UI_COLORS['border']};
+            border-bottom: none; border-top-left-radius: 4px;
+            border-top-right-radius: 4px;
+        }}
+        QTabBar::tab:selected {{
+            color: {UI_COLORS['blue']}; background: {UI_COLORS['surface']};
+            font-weight: bold;
+        }}
+        QTableWidget, QTreeWidget, QListWidget {{
+            color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
+            alternate-background-color: {UI_COLORS['surface_alt']};
+            border: 1px solid {UI_COLORS['border']}; border-radius: 3px;
+            selection-background-color: #D9E8FF; selection-color: #102A56;
+        }}
+        QHeaderView::section {{
+            min-height: 28px; padding: 3px 7px;
+            color: #344054; background: #EAECF0;
+            border: none; border-right: 1px solid {UI_COLORS['border']};
+            border-bottom: 1px solid {UI_COLORS['border']}; font-weight: bold;
+        }}
+        QGroupBox {{
+            border: 1px solid {UI_COLORS['border']}; border-radius: 5px;
+            margin-top: 10px; padding-top: 4px;
+        }}
+        QGroupBox::title {{ subcontrol-origin: margin; left: 9px; padding: 0 4px; }}
+        QScrollArea {{ border: none; background: transparent; }}
+        QProgressBar {{
+            min-height: 16px; color: #344054; background: #EAECF0;
+            border: 1px solid {UI_COLORS['border']}; border-radius: 4px;
+            text-align: center;
+        }}
+        QProgressBar::chunk {{ background: {UI_COLORS['blue']}; border-radius: 3px; }}
+        QSplitter::handle {{ background: #D8DEE8; }}
+        QSplitter::handle:hover {{ background: #98A2B3; }}
+    """)
 
 # HF uploader id -> Chinese name lives in config.json ("uploader_names"
 # section — edit that to add people). Ids with no entry render as 未知. Loaded once
@@ -141,7 +296,8 @@ def resolve_token():
     except Exception:
         return None
 
-pg.setConfigOptions(background="w", foreground="k", antialias=True)
+pg.setConfigOptions(
+    background=UI_COLORS["surface"], foreground=UI_COLORS["text"], antialias=True)
 
 # Dashboard table columns: (header, dataset key, kind). "__delta__" is special.
 TABLE_COLS = [
@@ -733,16 +889,20 @@ class MainWindow(QWidget):
         self.setWindowTitle("TacVerse 多模态物理具身数据集工作台")
         if LOGO_PATH.is_file():
             self.setWindowIcon(QIcon(str(LOGO_PATH)))
-        # Large default for a 2560x1440 display, but kept clearly below the work
-        # area (~82% w / ~85% h) and centred: opening too close to full-screen
-        # makes some window managers auto-maximize the window a moment after it
-        # maps. Start in the normal (non-maximized) state explicitly.
+        # Large default for a 2560x1440 display, but kept below the available
+        # work area (~90% w / ~86% h) and centred: availableGeometry already
+        # excludes the Windows taskbar and Linux desktop panels.  Staying below
+        # full-screen also avoids auto-maximize behaviour in some window managers.
         target_w, target_h = 2200, 1300
         screen = QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
-            target_w = min(target_w, int(avail.width() * 0.82))
-            target_h = min(target_h, int(avail.height() * 0.85))
+            target_w = min(target_w, int(avail.width() * 0.90))
+            target_h = min(target_h, int(avail.height() * 0.86))
+        screen_width = screen.availableGeometry().width() if screen else target_w
+        # 125%/150% Windows scaling reduces the logical screen width.  Shrink
+        # the frozen name column with it so the detail columns remain useful.
+        self.dataset_column_width = max(280, min(440, int(screen_width * 0.23)))
         self.setWindowState(Qt.WindowNoState)
         self.resize(target_w, target_h)
         if screen:
@@ -751,6 +911,7 @@ class MainWindow(QWidget):
             self.move(frame.topLeft())
         self.token = resolve_token()
         self.worker = None
+        self._stats_worker = None
         self.report = None
         self.history = []
         self._id_workers = []  # in-flight IdentityWorkers (kept alive until done)
@@ -864,6 +1025,8 @@ class MainWindow(QWidget):
     # ---- UI construction -------------------------------------------------- #
     def _build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 8)
+        root.setSpacing(8)
 
         toolbar = QWidget()
         toolbar_v = QVBoxLayout(toolbar)
@@ -925,42 +1088,51 @@ class MainWindow(QWidget):
             "QPushButton { font-weight: bold; padding: 5px 14px; border-radius: 6px;"
             " color: white; background: %s; }"
             "QPushButton:hover { background: %s; }"
-            "QPushButton:disabled { background: #B0B0B0; }"
+            "QPushButton:disabled { color:#667085; background:#E4E7EC; }"
         )
-        self.btn_stats.setStyleSheet(primary_css % ("#34A853", "#2E9247"))
-        self.btn_download.setStyleSheet(primary_css % ("#F59E0B", "#D98A00"))
-        self.btn_pull.setStyleSheet(primary_css % ("#4C8BF5", "#3B7AE0"))
+        self.btn_stats.setStyleSheet(
+            primary_css % (UI_COLORS["green"], UI_COLORS["green_hover"]))
+        self.btn_download.setStyleSheet(
+            primary_css % (UI_COLORS["amber"], UI_COLORS["amber_hover"]))
+        self.btn_pull.setStyleSheet(
+            primary_css % (UI_COLORS["blue"], UI_COLORS["blue_hover"]))
         secondary_css = (
-            "QPushButton { padding: 5px 12px; border-radius: 6px; color: #444;"
-            " border: 1px solid #C4C4C4; background: #F5F5F5; }"
-            "QPushButton:hover { background: #ECECEC; }"
+            f"QPushButton {{ padding:5px 12px; border-radius:5px;"
+            f" color:{UI_COLORS['text']}; border:1px solid {UI_COLORS['border_strong']};"
+            f" background:{UI_COLORS['surface']}; }}"
+            "QPushButton:hover { background:#F2F4F7; border-color:#98A2B3; }"
         )
         for b in (self.btn_stats, self.btn_download, self.btn_pull):
             b.setMinimumHeight(42)
             fit_button(b)
             top.addWidget(b)
-        top.addWidget(vline())
+        top.addStretch()
+
+        # Secondary tools live on their own row.  Keeping all actions in the
+        # first row overflowed on common Windows laptop widths once the CJK
+        # font and display scaling were applied.
         for b in (self.btn_check, self.btn_open):
             b.setStyleSheet(secondary_css)
             fit_button(b)
-            top.addWidget(b)
+            aux.addWidget(b)
 
-        top.addSpacing(12)
-        top.addWidget(QLabel("每日目标(小时):"))
+        aux.addWidget(vline())
+        aux.addWidget(QLabel("每日目标(小时):"))
         self.target_spin = QSpinBox()
         self.target_spin.setRange(0, 100000)
         self.target_spin.setValue(10)
-        self.target_spin.setMinimumWidth(76)
+        self.target_spin.setFixedWidth(76)
         self.target_spin.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
         self.target_spin.valueChanged.connect(self._refresh_kpis)
-        top.addWidget(self.target_spin)
-        top.addStretch()
+        aux.addWidget(self.target_spin)
+        aux.addStretch()
 
         # Viewer service controls, up here in the toolbar (the "Viewer" tab is
         # kept for now but may be removed later — these are the canonical ones).
         aux.addWidget(vline())
         self.top_viewer_dot = QLabel("● Viewer")
         self.top_viewer_dot.setToolTip("Viewer 服务状态")
+        self.top_viewer_dot.setFixedWidth(92)
         aux.addWidget(self.top_viewer_dot)
         self.top_viewer_start = QPushButton("启动")
         self.top_viewer_stop = QPushButton("停止")
@@ -977,8 +1149,6 @@ class MainWindow(QWidget):
             fit_button(b)
             aux.addWidget(b)
 
-        aux.addStretch()
-
         status_row.addWidget(vline())
         self.btn_account = QPushButton("切换账号")
         self.btn_account.setStyleSheet(secondary_css)
@@ -989,7 +1159,7 @@ class MainWindow(QWidget):
         # (e.g. "未登录(匿名) · TacVerse 可见 11 个") without any digging.
         self.identity_label = QLabel("登录状态: 检测中…")
         self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.identity_label.setStyleSheet("color:#888;")
+        self.identity_label.setStyleSheet(f"color:{UI_COLORS['text_muted']};")
         self.identity_label.setMinimumWidth(220)
         status_row.addWidget(self.identity_label)
         status_row.addStretch()
@@ -997,7 +1167,8 @@ class MainWindow(QWidget):
         # Live clock, far right.
         status_row.addWidget(vline())
         self.clock_label = QLabel("")
-        self.clock_label.setStyleSheet("color:#444; font-weight:bold;")
+        self.clock_label.setStyleSheet(
+            f"color:{UI_COLORS['text']}; font-weight:bold;")
         self.clock_label.setMinimumWidth(160)
         status_row.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
@@ -1017,6 +1188,8 @@ class MainWindow(QWidget):
 
         # Progress: status line + (bar + speed)
         self.status = QLabel("就绪")
+        self.status.setWordWrap(True)
+        self.status.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         root.addWidget(self.status)
         prog_row = QHBoxLayout()
@@ -1050,15 +1223,16 @@ class MainWindow(QWidget):
 
         # ===== LEFT: 数据集统计分区 =====
         left = QGroupBox("数据集统计分区")
-        left.setStyleSheet(
-            "QGroupBox{font-weight:bold; border:1px solid #9ec5fe;"
-            " border-radius:6px; margin-top:10px; background:#f6f9ff;}"
-            "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#1a73e8;}")
+        left.setStyleSheet(BLUE_PANEL_STYLE)
         lv = QVBoxLayout(left)
 
         # 数据集总览 (KPI cards, 4 per row)
         self.kpi_labels = {}
         kpi_grid = QGridLayout()
+        kpi_grid.setHorizontalSpacing(8)
+        kpi_grid.setVerticalSpacing(8)
+        for column in range(4):
+            kpi_grid.setColumnStretch(column, 1)
         for i, (key, title, hl) in enumerate(self.KPI_CARDS):
             kpi_grid.addWidget(self._make_card(key, title, hl), i // 4, i % 4)
         n = len(self.KPI_CARDS)
@@ -1066,7 +1240,8 @@ class MainWindow(QWidget):
         lv.addLayout(kpi_grid)
 
         self.baseline_hint = QLabel("")
-        self.baseline_hint.setStyleSheet("color: #888; font-size: 12px;")
+        self.baseline_hint.setStyleSheet(MUTED_TEXT_STYLE)
+        self.baseline_hint.setWordWrap(True)
         lv.addWidget(self.baseline_hint)
 
         # Filter box
@@ -1082,7 +1257,8 @@ class MainWindow(QWidget):
         lv.addLayout(filt)
 
         # 数据集详情 (table)
-        self.table = FrozenDatasetTable(0, len(TABLE_COLS), frozen_width=440)
+        self.table = FrozenDatasetTable(
+            0, len(TABLE_COLS), frozen_width=self.dataset_column_width)
         self.table.setHorizontalHeaderLabels([c[0] for c in TABLE_COLS])
         self.table.horizontalHeaderItem(LOCAL_COL).setToolTip(
             "本地文件表示原始数据是否已下载到 pulls/，已下载的数据集可在 Viewer 打开。")
@@ -1097,26 +1273,25 @@ class MainWindow(QWidget):
         for i in range(self.table.detail.columnCount()):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         hdr.setStretchLastSection(True)
-        self.table.setColumnWidth(0, 440)
+        self.table.setColumnWidth(0, self.dataset_column_width)
         lv.addWidget(self.table, 1)
         self.table_hint = QLabel("点「仅拉取统计信息」加载数据集列表(双击行打开 HF 页面)。")
+        self.table_hint.setWordWrap(True)
         lv.addWidget(self.table_hint)
 
         # ===== RIGHT: 数据集检查分区 =====
         right = QGroupBox("数据集检查分区")
-        right.setStyleSheet(
-            "QGroupBox{font-weight:bold; border:1px solid #a3d9a5;"
-            " border-radius:6px; margin-top:10px; background:#f5fbf5;}"
-            "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#2e7d32;}")
+        right.setStyleSheet(GREEN_PANEL_STYLE)
         rv = QVBoxLayout(right)
         rv.addWidget(self._build_prompt_panel())
 
         split.addWidget(left)
         split.addWidget(right)
+        split.setChildrenCollapsible(False)
         split.setStretchFactor(0, 3)
         split.setStretchFactor(1, 2)
-        split.setCollapsible(1, True)
         split.setSizes([1300, 900])
+        self.dashboard_splitter = split
         outer.addWidget(split)
         return w
 
@@ -1157,7 +1332,7 @@ class MainWindow(QWidget):
         pv.setContentsMargins(8, 0, 0, 0)
 
         self.prompt_meta = QLabel("")
-        self.prompt_meta.setStyleSheet("color: #888; font-size: 12px;")
+        self.prompt_meta.setStyleSheet(MUTED_TEXT_STYLE)
         self.prompt_meta.setWordWrap(True)
         pv.addWidget(self.prompt_meta)
 
@@ -1173,7 +1348,7 @@ class MainWindow(QWidget):
         # Every block boundary is a drag handle, so each block can be freely
         # enlarged/shrunk and its neighbours take up the slack — the fixed
         # grid ratios never fit both laptop and wide screens.
-        splitter_css = "QSplitter::handle{background:#dcecdc;}"
+        splitter_css = "QSplitter::handle{background:#B7D5BC;} QSplitter::handle:hover{background:#72B77F;}"
         self.detail_grid = QSplitter(Qt.Vertical)   # top row | mid row | insights
         detail_top = QSplitter(Qt.Horizontal)       # ANNOTATIONS | (STATISTICS/检查规则)
         detail_right_col = QSplitter(Qt.Vertical)   # STATISTICS over 检查规则
@@ -1185,10 +1360,7 @@ class MainWindow(QWidget):
         self.detail_grid.addWidget(detail_mid)
 
         # 浅绿色分组样式 — 与右侧「数据集检查分区」保持一致
-        green_box_css = (
-            "QGroupBox{font-weight:bold; border:1px solid #a3d9a5;"
-            " border-radius:6px; margin-top:8px; background:#f5fbf5;}"
-            "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#2e7d32;}")
+        green_box_css = GREEN_PANEL_STYLE
 
         # ANNOTATIONS 标注 — local task instruction + viewer language annotations
         ann_box = QGroupBox("ANNOTATIONS 标注")
@@ -1200,11 +1372,11 @@ class MainWindow(QWidget):
         self.task_list.setMaximumHeight(84)
         al.addWidget(self.task_list)
         self.task_note = QLabel("")
-        self.task_note.setStyleSheet("color: #999; font-size: 12px;")
+        self.task_note.setStyleSheet(MUTED_TEXT_STYLE)
         self.task_note.setWordWrap(True)
         al.addWidget(self.task_note)
         anno_hd = QLabel("语言标注 (viewer)")
-        anno_hd.setStyleSheet("color: #555;")
+        anno_hd.setStyleSheet(f"color:{UI_COLORS['text']};")
         al.addWidget(anno_hd)
         ep_row = QHBoxLayout()
         ep_row.addWidget(QLabel("集:"))
@@ -1218,7 +1390,7 @@ class MainWindow(QWidget):
         self.prompt_tree.setRootIsDecorated(True)
         al.addWidget(self.prompt_tree, 1)
         self.anno_note = QLabel("")
-        self.anno_note.setStyleSheet("color: #999; font-size: 12px;")
+        self.anno_note.setStyleSheet(MUTED_TEXT_STYLE)
         self.anno_note.setWordWrap(True)
         al.addWidget(self.anno_note)
         detail_top.addWidget(self._block_scroll(ann_box))  # left column, tall
@@ -1238,7 +1410,7 @@ class MainWindow(QWidget):
         rules_box = QGroupBox("检查规则")
         rules_box.setStyleSheet(green_box_css)
         rul = QVBoxLayout(rules_box)
-        # Two rows so the block's natural width stays small enough to drag.
+        # Two-column grid keeps the block's natural width small enough to drag.
         self.btn_quality_check = QPushButton("执行深度检查")
         self.btn_quality_check.setToolTip("按需缓存远程文件并生成问题视频切片，耗时操作会在后台执行。")
         self.btn_quality_check.clicked.connect(self.on_quality_check)
@@ -1255,43 +1427,50 @@ class MainWindow(QWidget):
         self.btn_clear_quality_cache.clicked.connect(self.on_clear_quality_cache)
         self.btn_quality_settings = QPushButton("检查设置")
         self.btn_quality_settings.clicked.connect(self.on_quality_settings)
-        for group in (
-            (self.btn_quality_check, self.btn_quality_cancel,
-             self.btn_open_quality_report, self.btn_export_quality_report),
-            (self.btn_clear_quality_reports, self.btn_clear_quality_cache,
-             self.btn_quality_settings),
-        ):
-            qrow = QHBoxLayout()
-            for btn in group:
-                qrow.addWidget(btn)
-            qrow.addStretch(1)
-            rul.addLayout(qrow)
+        # Two columns stay usable in the narrow right-hand splitter on Windows;
+        # a single long row used to force horizontal scrolling at 125% DPI.
+        quality_actions = QGridLayout()
+        quality_actions.setHorizontalSpacing(6)
+        quality_actions.setVerticalSpacing(6)
+        quality_buttons = (
+            self.btn_quality_check, self.btn_quality_cancel,
+            self.btn_open_quality_report, self.btn_export_quality_report,
+            self.btn_clear_quality_reports, self.btn_clear_quality_cache,
+            self.btn_quality_settings,
+        )
+        for index, btn in enumerate(quality_buttons):
+            quality_actions.addWidget(btn, index // 2, index % 2)
+        quality_actions.setColumnStretch(0, 1)
+        quality_actions.setColumnStretch(1, 1)
+        rul.addLayout(quality_actions)
         self.quality_progress = QProgressBar()
         self.quality_progress.setRange(0, 100)
         self.quality_progress.setVisible(False)
         rul.addWidget(self.quality_progress)
         self.quality_note = QLabel("")
-        self.quality_note.setStyleSheet("color: #777; font-size: 12px;")
+        self.quality_note.setStyleSheet(MUTED_TEXT_STYLE)
         self.quality_note.setWordWrap(True)
         rul.addWidget(self.quality_note)
         self.check_tree = self._panel_tree()
         self.check_tree.setRootIsDecorated(True)
         rul.addWidget(self.check_tree, 1)
         self.quality_overview = QLabel("")
-        self.quality_overview.setStyleSheet("color:#555; font-size:12px;")
+        self.quality_overview.setStyleSheet(MUTED_TEXT_STYLE)
         self.quality_overview.setWordWrap(True)
         rul.addWidget(self.quality_overview)
-        issue_btn_row = QHBoxLayout()
-        for label, status in (
+        issue_btn_row = QGridLayout()
+        issue_btn_row.setHorizontalSpacing(6)
+        for column, (label, status) in enumerate((
             ("确认问题", "确认问题"),
             ("误报", "误报"),
             ("已修复", "已修复"),
             ("未确认", "未确认"),
-        ):
+        )):
             btn = QPushButton(label)
             btn.clicked.connect(lambda _=False, s=status: self.on_mark_quality_issue(s))
-            issue_btn_row.addWidget(btn)
-        issue_btn_row.addStretch(1)
+            issue_btn_row.addWidget(btn, 0, column)
+        for column in range(4):
+            issue_btn_row.setColumnStretch(column, 1)
         rul.addLayout(issue_btn_row)
         self.quality_issue_tree = QTreeWidget()
         self.quality_issue_tree.setHeaderLabels(["#", "episode", "问题", "字段", "时间", "确认状态"])
@@ -1315,7 +1494,7 @@ class MainWindow(QWidget):
         frames_box = QGroupBox("FRAMES 首位帧")
         frl = QVBoxLayout(frames_box)
         ph = QLabel("占位，暂未实现")
-        ph.setStyleSheet("color: #bbb;")
+        ph.setStyleSheet(f"color:{UI_COLORS['text_disabled']};")
         ph.setAlignment(Qt.AlignCenter)
         frl.addWidget(ph, 1)
         detail_mid.addWidget(self._block_scroll(frames_box))
@@ -1346,7 +1525,7 @@ class MainWindow(QWidget):
 
         # --- Fallback: nothing selected -------------------------------------
         self.prompt_empty = QLabel("选择左侧数据集查看信息。")
-        self.prompt_empty.setStyleSheet("color: #999;")
+        self.prompt_empty.setStyleSheet(MUTED_TEXT_STYLE)
         self.prompt_empty.setWordWrap(True)
         self.prompt_empty.setAlignment(Qt.AlignCenter)
         pv.addWidget(self.prompt_empty, 1)
@@ -1358,20 +1537,24 @@ class MainWindow(QWidget):
     def _make_card(self, key, title, highlight=False):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        card.setMinimumHeight(78)
         if highlight:
             # 总小时数 — the key metric, visually distinct.
             card.setStyleSheet(
-                "QFrame{background:#e8f5e9; border:1px solid #66bb6a;"
+                "QFrame{background:#E8F5E9; border:1px solid #66BB6A;"
                 " border-radius:6px;}")
         cv = QVBoxLayout(card)
         t = QLabel(title)
         t.setStyleSheet(
-            "color:#1b5e20; font-size:12px; font-weight:bold;" if highlight
-            else "color:#666; font-size:12px;")
+            "color:#1B5E20; font-size:9pt; font-weight:bold;" if highlight
+            else f"color:{UI_COLORS['text_muted']}; font-size:9pt;")
         val = QLabel("—")
         val.setStyleSheet(
-            "font-size:26px; font-weight:bold; color:#2e7d32;" if highlight
-            else "font-size:22px; font-weight:bold;")
+            "font-size:19pt; font-weight:bold; color:#237A36;" if highlight
+            else "font-size:17pt; font-weight:bold;")
+        val.setWordWrap(True)
+        val.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         val.setTextInteractionFlags(Qt.TextSelectableByMouse)
         cv.addWidget(t)
         cv.addWidget(val)
@@ -1382,15 +1565,22 @@ class MainWindow(QWidget):
         """Special card: today's top contributor (by new hours) + their tallies."""
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
+        card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        card.setMinimumHeight(78)
         cv = QVBoxLayout(card)
         t = QLabel("今日 MVP ⭐")
-        t.setStyleSheet("color: #666; font-size: 12px;")
+        t.setStyleSheet(f"color:{UI_COLORS['text_muted']}; font-size:9pt;")
         self.mvp_name_lbl = QLabel("—")
         self.mvp_name_lbl.setStyleSheet(
-            "font-size: 22px; font-weight: bold; color:#F9A825;")
+            "font-size:17pt; font-weight:bold; color:#B54708;")
+        self.mvp_name_lbl.setWordWrap(True)
+        self.mvp_name_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         self.mvp_name_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.mvp_sub_lbl = QLabel("")
-        self.mvp_sub_lbl.setStyleSheet("color:#888; font-size: 11px;")
+        self.mvp_sub_lbl.setStyleSheet(
+            f"color:{UI_COLORS['text_muted']}; font-size:8pt;")
+        self.mvp_sub_lbl.setWordWrap(True)
+        self.mvp_sub_lbl.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
         cv.addWidget(t)
         cv.addWidget(self.mvp_name_lbl)
         cv.addWidget(self.mvp_sub_lbl)
@@ -1468,7 +1658,7 @@ class MainWindow(QWidget):
         period_v.addLayout(period_row)
 
         self.period_hint = QLabel("按上方时间周期汇总当前分组维度的新增小时。")
-        self.period_hint.setStyleSheet("color:#888; font-size:12px;")
+        self.period_hint.setStyleSheet(MUTED_TEXT_STYLE)
         period_v.addWidget(self.period_hint)
         self.period_group_table = QTableWidget(0, 4)
         self.period_group_table.setHorizontalHeaderLabels(
@@ -1486,7 +1676,7 @@ class MainWindow(QWidget):
         daily_group_box = QGroupBox("单组单日新增总时长")
         daily_group_v = QVBoxLayout(daily_group_box)
         self.daily_group_hint = QLabel("按 Hugging Face commit history 分日，随当前分组维度统计真实新增小时。")
-        self.daily_group_hint.setStyleSheet("color:#888; font-size:12px;")
+        self.daily_group_hint.setStyleSheet(MUTED_TEXT_STYLE)
         daily_group_v.addWidget(self.daily_group_hint)
         self.daily_group_table = QTableWidget(0, 5)
         self.daily_group_table.setHorizontalHeaderLabels(
@@ -1541,10 +1731,7 @@ class MainWindow(QWidget):
 
         # ===== LEFT: dataset detail table (mirrors 看板) =====
         left = QGroupBox("数据集详情（选中要编辑 / 操作的数据集）")
-        left.setStyleSheet(
-            "QGroupBox{font-weight:bold; border:1px solid #9ec5fe;"
-            " border-radius:6px; margin-top:10px; background:#f6f9ff;}"
-            "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#1a73e8;}")
+        left.setStyleSheet(BLUE_PANEL_STYLE)
         lv = QVBoxLayout(left)
         ef = QHBoxLayout()
         ef.addWidget(QLabel("筛选:"))
@@ -1573,7 +1760,7 @@ class MainWindow(QWidget):
         for i in range(1, len(TABLE_COLS)):
             ehdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         ehdr.setStretchLastSection(True)
-        self.edit_table.setColumnWidth(0, 380)
+        self.edit_table.setColumnWidth(0, max(300, self.dataset_column_width - 40))
         lv.addWidget(self.edit_table, 1)
         split.addWidget(left)
 
@@ -1604,7 +1791,7 @@ class MainWindow(QWidget):
         self.edit_prompt_box = QVBoxLayout(self.edit_prompt_holder)
         self.edit_prompt_box.setContentsMargins(0, 0, 0, 0)
         note = QLabel("（未选择数据集）")
-        note.setStyleSheet("color:#888;")
+        note.setStyleSheet(MUTED_TEXT_STYLE)
         self.edit_prompt_box.addWidget(note)
         av.addWidget(self.edit_prompt_holder)
         arow = QHBoxLayout()
@@ -1612,17 +1799,17 @@ class MainWindow(QWidget):
         self.btn_make_copy.setMinimumHeight(32)
         self.btn_make_copy.setStyleSheet(
             "QPushButton { font-weight:bold; padding:6px 16px; border-radius:6px;"
-            " color:white; background:#34A853; }"
-            "QPushButton:hover { background:#2E9247; }"
+            f" color:white; background:{UI_COLORS['green']}; }}"
+            f"QPushButton:hover {{ background:{UI_COLORS['green_hover']}; }}"
             "QPushButton:disabled { background:#B0B0B0; }")
         self.btn_make_copy.clicked.connect(self.on_make_copy)
         self.btn_push_copy = QPushButton("推送到 Hub")
         self.btn_push_copy.setMinimumHeight(32)
         self.btn_push_copy.setStyleSheet(
-            "QPushButton { padding:6px 12px; border-radius:6px; color:#444;"
-            " border:1px solid #C4C4C4; background:#F5F5F5; }"
-            "QPushButton:hover { background:#ECECEC; }"
-            "QPushButton:disabled { color:#AAA; }")
+            f"QPushButton {{ padding:6px 12px; border-radius:5px; color:{UI_COLORS['text']};"
+            f" border:1px solid {UI_COLORS['border_strong']}; background:{UI_COLORS['surface']}; }}"
+            "QPushButton:hover { background:#F2F4F7; border-color:#98A2B3; }"
+            f"QPushButton:disabled {{ color:{UI_COLORS['text_disabled']}; }}")
         self.btn_push_copy.clicked.connect(self.on_push_copy)
         arow.addWidget(self.btn_make_copy)
         arow.addWidget(self.btn_push_copy)
@@ -1652,14 +1839,14 @@ class MainWindow(QWidget):
         self.btn_run_op.setMinimumHeight(32)
         self.btn_run_op.setStyleSheet(
             "QPushButton { font-weight:bold; padding:6px 16px; border-radius:6px;"
-            " color:white; background:#4C8BF5; }"
-            "QPushButton:hover { background:#3B7AE0; }"
+            f" color:white; background:{UI_COLORS['blue']}; }}"
+            f"QPushButton:hover {{ background:{UI_COLORS['blue_hover']}; }}"
             "QPushButton:disabled { background:#B0B0B0; }")
         self.btn_run_op.clicked.connect(self.on_run_op)
         bv.addWidget(self.btn_run_op)
         self.op_note = QLabel(
             "输出写到 pulls/<今天>/，视频操作用 CPU 编码(libx264)较慢，请耐心等待。")
-        self.op_note.setStyleSheet("color:#888; font-size:12px;")
+        self.op_note.setStyleSheet(MUTED_TEXT_STYLE)
         self.op_note.setWordWrap(True)
         bv.addWidget(self.op_note)
         rv.addWidget(boxB)
@@ -1667,7 +1854,7 @@ class MainWindow(QWidget):
         self.edit_result = QLabel("")
         self.edit_result.setWordWrap(True)
         self.edit_result.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.edit_result.setStyleSheet("color:#2e7d32;")
+        self.edit_result.setStyleSheet(f"color:{UI_COLORS['green']};")
         rv.addWidget(self.edit_result)
         rv.addStretch()
 
@@ -1705,7 +1892,7 @@ class MainWindow(QWidget):
         self.op_split_spec.setPlaceholderText("train:0.8,val:0.2  或  train:0-4,val:5-6")
         v.addWidget(self.op_split_spec)
         tip = QLabel("输出为 <输出名>_train / <输出名>_val 等，写到 pulls/<今天>/。")
-        tip.setStyleSheet("color:#888; font-size:12px;")
+        tip.setStyleSheet(MUTED_TEXT_STYLE)
         tip.setWordWrap(True)
         v.addWidget(tip)
         return w
@@ -1839,7 +2026,7 @@ class MainWindow(QWidget):
             self.edit_src_lbl.setText("—")
             self.edit_name.setText("")
             note = QLabel("请选择一个已下载(已拉取)的数据集（仅统计的行不能编辑）。")
-            note.setStyleSheet("color:#888;")
+            note.setStyleSheet(MUTED_TEXT_STYLE)
             self.edit_prompt_box.addWidget(note)
             self.op_rm_list.clear()
             self._set_edit_enabled(False)
@@ -1857,7 +2044,7 @@ class MainWindow(QWidget):
             self.edit_prompt_box.addWidget(note)
         elif not rows:
             note = QLabel("该数据集没有 tasks.parquet（无可编辑指令），仍可改名生成副本。")
-            note.setStyleSheet("color:#888;")
+            note.setStyleSheet(MUTED_TEXT_STYLE)
             self.edit_prompt_box.addWidget(note)
         else:
             for r in rows:
@@ -2151,10 +2338,10 @@ class MainWindow(QWidget):
         v = QVBoxLayout(w)
 
         self.viewer_status = QLabel("")
-        self.viewer_status.setStyleSheet("font-size: 15px;")
+        self.viewer_status.setStyleSheet("font-size:11pt; font-weight:bold;")
         v.addWidget(self.viewer_status)
         self.viewer_detail = QLabel("")
-        self.viewer_detail.setStyleSheet("color: #888; font-size: 12px;")
+        self.viewer_detail.setStyleSheet(MUTED_TEXT_STYLE)
         self.viewer_detail.setWordWrap(True)
         v.addWidget(self.viewer_detail)
 
@@ -2177,7 +2364,8 @@ class MainWindow(QWidget):
         self.viewer_placeholder.setAlignment(Qt.AlignCenter)
         self.viewer_placeholder.setWordWrap(True)
         self.viewer_placeholder.setStyleSheet(
-            "color: #aaa; border: 1px dashed #ccc; padding: 24px;")
+            f"color:{UI_COLORS['text_muted']}; border:1px dashed "
+            f"{UI_COLORS['border']}; padding:24px;")
         v.addWidget(self.viewer_placeholder, 1)
 
         self._viewer_tick = 0
@@ -2231,8 +2419,9 @@ class MainWindow(QWidget):
         extra = f" · 可见数据集 {self._viewer_count}" if self._viewer_count is not None else ""
 
         # Toolbar controls (canonical).
-        self.top_viewer_dot.setText(
-            f'<span style="color:{color}">●</span> Viewer: {text} · {st["port"]}')
+        self.top_viewer_dot.setText(f'<span style="color:{color}">●</span> Viewer')
+        self.top_viewer_dot.setToolTip(
+            f"Viewer: {text} · 端口 {st['port']}\n{st['url'] or '服务未启动'}")
         self.top_viewer_start.setEnabled(not st["running"])
         self.top_viewer_stop.setEnabled(st["managed"])
         self.top_viewer_home.setEnabled(st["ready"])
@@ -2770,7 +2959,7 @@ class MainWindow(QWidget):
         widgets["remote_enabled"] = remote_enabled
 
         note = QLabel("保存后立即用于本次进程，并写入 config.json；已存在报告不会自动重算。")
-        note.setStyleSheet("color:#888; font-size:12px;")
+        note.setStyleSheet(MUTED_TEXT_STYLE)
         note.setWordWrap(True)
         form.addRow(note)
         bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -2896,7 +3085,7 @@ class MainWindow(QWidget):
 
     def _report_set_note(self, msg, busy=False):
         """Put a status/placeholder message in the three report-driven boxes."""
-        note = f"<span style='color:#999'>{_esc(msg)}</span>"
+        note = f"<span style='color:{UI_COLORS['text_muted']}'>{_esc(msg)}</span>"
         for lbl in (self.stat_view, self.filter_view, self.insight_view):
             lbl.setText(note)
         self.report_progress.setVisible(busy)
@@ -2952,7 +3141,7 @@ class MainWindow(QWidget):
             return f"<b style='color:{c}'>{_esc(label)}</b>"
 
         def detail(text):  # muted sub-line under a value (like the viewer badge)
-            return (f"<div style='color:#8a8f99; font-size:11px;"
+            return (f"<div style='color:{UI_COLORS['text_muted']}; font-size:8pt;"
                     f" margin-top:2px'>{_esc(text)}</div>")
 
         def kv_table(rows):  # 内嵌 2 列表格：指标 | 值
@@ -2974,7 +3163,7 @@ class MainWindow(QWidget):
         st_col = "#2e7d32" if st == "ok" else "#c62828"
         st_html = f"<b style='color:{st_col}'>{_esc(st)}</b>"
         if integ.get("issues"):
-            st_html += (f"<br><span style='color:#c62828; font-size:11px'>"
+            st_html += (f"<br><span style='color:{UI_COLORS['red']}; font-size:8pt'>"
                         f"{_esc('; '.join(integ['issues']))}</span>")
 
         trows = [("完整性", st_html),
@@ -3004,11 +3193,12 @@ class MainWindow(QWidget):
                 html += "<ul style='margin:6px 0 0 -24px;'>" + "".join(
                     f"<li>{_esc(l)}</li>" for l in lines) + "</ul>"
             if sm.get("tip"):
-                html += f"<div style='color:#999; margin-top:4px'>{_esc(sm['tip'])}</div>"
+                html += f"<div style='color:{UI_COLORS['text_muted']}; margin-top:4px'>{_esc(sm['tip'])}</div>"
             html += "</div>"
             self.filter_view.setText(html)
         else:
-            self.filter_view.setText("<span style='color:#999'>无平滑度数据</span>")
+            self.filter_view.setText(
+                f"<span style='color:{UI_COLORS['text_muted']}'>无平滑度数据</span>")
 
         # --- ACTION INSIGHTS: training config (内嵌表格) ---
         irows = []
@@ -3041,12 +3231,12 @@ class MainWindow(QWidget):
             tail = (" <span style='color:#c62828'>· 需速度归一</span>"
                     if sv.get("needsVelocityNorm") else "")
             val = (f"{verdict((sv.get('verdict') or {}).get('label'))} "
-                   f"<span style='color:#8a8f99'>cv {round(sv.get('cv', 0), 3)}</span>{tail}")
+                   f"<span style='color:{UI_COLORS['text_muted']}'>cv {round(sv.get('cv', 0), 3)}</span>{tail}")
             irows.append(("速度方差", val))
         meta = r.get("meta") or {}
         if meta.get("sampledEpisodes") is not None:
             irows.append(("抽样",
-                          f"<span style='color:#aaa'>{meta.get('sampledEpisodes')} 集</span>"))
+                          f"<span style='color:{UI_COLORS['text_disabled']}'>{meta.get('sampledEpisodes')} 集</span>"))
         self.insight_view.setText(kv_table(irows))
 
     def _refresh_tasks(self, inline, path):
@@ -3375,7 +3565,7 @@ class MainWindow(QWidget):
         form.addRow("Token:", tok_wrap)
         hint = QLabel("Token 会保存到本地 .hf_token（已被 git 忽略，不会上传或"
                       "同步给他人），下次启动自动使用。清除请删除该文件。")
-        hint.setStyleSheet("color:#888; font-size:12px;")
+        hint.setStyleSheet(MUTED_TEXT_STYLE)
         hint.setWordWrap(True)
         form.addRow(hint)
 
@@ -3403,7 +3593,7 @@ class MainWindow(QWidget):
         if not org:
             return
         self.identity_label.setText("登录状态: 检测中…")
-        self.identity_label.setStyleSheet("color:#888;")
+        self.identity_label.setStyleSheet(f"color:{UI_COLORS['text_muted']};")
         self._id_seq += 1
         seq = self._id_seq
         w = IdentityWorker(org, self.token)
@@ -3531,12 +3721,35 @@ class MainWindow(QWidget):
         self._set_busy(True)
         self.bar.setValue(0)
         self.status.setText(f"开始统计 {org}（仅读取信息，不下载）...")
-        self.worker = StatsWorker(org, self.token)
-        self.worker.log.connect(self.status.setText)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.done.connect(self._on_stats_done)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
+        worker = StatsWorker(org, self.token)
+        self.worker = worker
+        self._stats_worker = worker
+        worker.log.connect(self.status.setText)
+        worker.progress.connect(self._on_progress)
+        worker.done.connect(self._on_stats_done)
+        # Keep the busy lock until QThread.run() has actually returned.  The
+        # worker emits done just before returning, so unlocking in _on_stats_done
+        # allowed a second click to replace a still-running QThread.
+        worker.error.connect(self._on_stats_error)
+        worker.finished.connect(self._on_stats_worker_finished)
+        worker.start()
+
+    def _on_stats_error(self, msg):
+        """Show a stats failure; _on_stats_worker_finished unlocks the UI."""
+        self._stop_speed()
+        self.status.setText(f"错误: {msg}")
+        QMessageBox.critical(self, "错误", msg)
+
+    def _on_stats_worker_finished(self):
+        """Release the stats worker only after its native thread is stopped."""
+        worker = self.sender()
+        if worker is self._stats_worker:
+            self._stats_worker = None
+        if worker is self.worker:
+            self.worker = None
+        self._set_busy(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_progress(self, done, total):
         self.bar.setMaximum(max(total, 1))
@@ -3587,7 +3800,6 @@ class MainWindow(QWidget):
         except OSError as exc:
             hist_note = f"（历史未写入: {exc}）"
         self._refresh_all()
-        self._set_busy(False)
         fails = len(report.get("failures", []))
         msg = f"统计完成: {report['count']}/{report['requested']} 个数据集，共 {report['total_hours']} 小时"
         if fails:
@@ -3639,6 +3851,7 @@ APP_ID = "tacverse-workbench"  # WM class / desktop-file base name (taskbar matc
 
 def main():
     app = QApplication(sys.argv)
+    configure_application_ui(app)
     # Taskbar/dock icon: an app-level icon plus a stable WM class that matches an
     # installed <APP_ID>.desktop, so GNOME/Ubuntu show the logo instead of the
     # generic gear. (setWindowIcon on the window alone is not enough on Linux.)
