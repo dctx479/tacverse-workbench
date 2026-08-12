@@ -27,7 +27,9 @@ from pathlib import Path
 
 import pyqtgraph as pg
 from PySide6.QtCore import QDate, Qt, QPoint, QRect, QSize, QThread, QTimer, Signal, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import (
+    QBrush, QColor, QDesktopServices, QFontDatabase, QIcon, QPalette, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget,
@@ -53,6 +55,101 @@ OUT_DIR = str(Path(DATASETS_ROOT) / DEFAULT_DATASET_ORG)
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"  # logos / image assets
 LOGO_PATH = ASSETS_DIR / "logo.png"
 RECENT_ORGS = ["TacVerse", "Xense"]  # seeds the editable org combo
+
+# Use one light palette across platforms. Without an application palette,
+# Windows dark mode can provide light text while the panel styles below still
+# force light backgrounds, making labels and table content unreadable.
+UI_COLORS = {
+    "window": "#F3F5F7",
+    "surface": "#FFFFFF",
+    "surface_alt": "#F7F9FC",
+    "border": "#D0D5DD",
+    "border_strong": "#B8C0CC",
+    "text": "#1D2939",
+    "text_muted": "#667085",
+    "text_disabled": "#98A2B3",
+    "blue": "#2563EB",
+}
+
+
+def configure_application_ui(app):
+    """Apply consistent metrics, colors, and CJK fonts on every desktop OS."""
+    app.setStyle("Fusion")
+
+    palette = QPalette()
+    palette.setColor(QPalette.Window, QColor(UI_COLORS["window"]))
+    palette.setColor(QPalette.WindowText, QColor(UI_COLORS["text"]))
+    palette.setColor(QPalette.Base, QColor(UI_COLORS["surface"]))
+    palette.setColor(QPalette.AlternateBase, QColor(UI_COLORS["surface_alt"]))
+    palette.setColor(QPalette.ToolTipBase, QColor("#101828"))
+    palette.setColor(QPalette.ToolTipText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.Text, QColor(UI_COLORS["text"]))
+    palette.setColor(QPalette.Button, QColor(UI_COLORS["surface"]))
+    palette.setColor(QPalette.ButtonText, QColor(UI_COLORS["text"]))
+    palette.setColor(QPalette.Link, QColor(UI_COLORS["blue"]))
+    palette.setColor(QPalette.Highlight, QColor(UI_COLORS["blue"]))
+    palette.setColor(QPalette.HighlightedText, QColor("#FFFFFF"))
+    palette.setColor(QPalette.PlaceholderText, QColor(UI_COLORS["text_disabled"]))
+    palette.setColor(
+        QPalette.Disabled, QPalette.Text, QColor(UI_COLORS["text_disabled"]))
+    palette.setColor(
+        QPalette.Disabled, QPalette.ButtonText, QColor(UI_COLORS["text_disabled"]))
+    app.setPalette(palette)
+
+    preferred_family = {
+        "win32": "Microsoft YaHei UI",
+        "darwin": "PingFang SC",
+    }.get(sys.platform, "Noto Sans CJK SC")
+    font = QFontDatabase.systemFont(QFontDatabase.GeneralFont)
+    font.setFamily(preferred_family)
+    font.setPointSize(10)
+    app.setFont(font)
+
+    # Qt uses logical pixels here, so these metrics remain stable under Windows
+    # 125%/150% display scaling while matching Linux and macOS control sizes.
+    app.setStyleSheet(f"""
+        QWidget {{ color: {UI_COLORS['text']}; }}
+        QToolTip {{
+            color: #FFFFFF; background: #101828; border: 1px solid #344054;
+            padding: 4px 6px;
+        }}
+        QLineEdit, QComboBox, QSpinBox, QDateEdit {{
+            min-height: 28px; padding: 2px 7px;
+            color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
+            border: 1px solid {UI_COLORS['border_strong']}; border-radius: 4px;
+            selection-background-color: {UI_COLORS['blue']};
+            selection-color: #FFFFFF;
+        }}
+        QComboBox QAbstractItemView {{
+            color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
+            selection-background-color: {UI_COLORS['blue']};
+            selection-color: #FFFFFF;
+        }}
+        QTabWidget::pane {{
+            background: {UI_COLORS['surface']};
+            border: 1px solid {UI_COLORS['border']};
+        }}
+        QTableWidget, QTreeWidget, QListWidget {{
+            color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
+            alternate-background-color: {UI_COLORS['surface_alt']};
+            border: 1px solid {UI_COLORS['border']};
+            selection-background-color: #D9E8FF; selection-color: #102A56;
+        }}
+        QHeaderView::section {{
+            min-height: 28px; padding: 3px 7px;
+            color: #344054; background: #EAECF0;
+            border: none; border-right: 1px solid {UI_COLORS['border']};
+            border-bottom: 1px solid {UI_COLORS['border']}; font-weight: bold;
+        }}
+        QProgressBar {{
+            min-height: 16px; color: #344054; background: #EAECF0;
+            border: 1px solid {UI_COLORS['border']}; border-radius: 4px;
+            text-align: center;
+        }}
+        QProgressBar::chunk {{ background: {UI_COLORS['blue']}; }}
+        QSplitter::handle {{ background: #D8DEE8; }}
+        QSplitter::handle:hover {{ background: #98A2B3; }}
+    """)
 
 # HF uploader id -> Chinese name lives in the unified config.json ("uploader_names"
 # section — edit that to add people). Ids with no entry render as 未知. Loaded once
@@ -121,7 +218,8 @@ def resolve_token():
     except Exception:
         return None
 
-pg.setConfigOptions(background="w", foreground="k", antialias=True)
+pg.setConfigOptions(
+    background=UI_COLORS["surface"], foreground=UI_COLORS["text"], antialias=True)
 
 # Dashboard table columns: (header, dataset key, kind). "__delta__" is special.
 TABLE_COLS = [
@@ -606,6 +704,10 @@ class MainWindow(QWidget):
             avail = screen.availableGeometry()
             target_w = min(target_w, int(avail.width() * 0.90))
             target_h = min(target_h, int(avail.height() * 0.88))
+        screen_width = screen.availableGeometry().width() if screen else target_w
+        # Windows scaling reduces the logical screen width. Keep the dataset
+        # name useful without letting its fixed width squeeze every detail field.
+        self.dataset_column_width = max(280, min(440, int(screen_width * 0.23)))
         self.setWindowState(Qt.WindowNoState)
         self.resize(target_w, target_h)
         if screen:
@@ -674,6 +776,8 @@ class MainWindow(QWidget):
     # ---- UI construction -------------------------------------------------- #
     def _build_ui(self):
         root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 8)
+        root.setSpacing(8)
 
         # The toolbar is intentionally split into two functional rows.  The
         # first row contains data acquisition/maintenance actions; the second
@@ -776,7 +880,7 @@ class MainWindow(QWidget):
         row2.addWidget(self.btn_account)
         self.identity_label = QLabel("登录状态: 检测中…")
         self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.identity_label.setStyleSheet("color:#888;")
+        self.identity_label.setStyleSheet(f"color:{UI_COLORS['text_muted']};")
         self.identity_label.setMinimumWidth(245)
         row2.addWidget(self.identity_label)
 
@@ -784,6 +888,7 @@ class MainWindow(QWidget):
         section_label("Viewer", row2)
         self.top_viewer_dot = QLabel("● Viewer")
         self.top_viewer_dot.setToolTip("Viewer 服务状态")
+        self.top_viewer_dot.setFixedWidth(92)
         row2.addWidget(self.top_viewer_dot)
         self.top_viewer_start = QPushButton("启动")
         self.top_viewer_stop = QPushButton("停止")
@@ -812,7 +917,8 @@ class MainWindow(QWidget):
 
         row2.addStretch(1)
         self.clock_label = QLabel("")
-        self.clock_label.setStyleSheet("color:#444; font-weight:bold;")
+        self.clock_label.setStyleSheet(
+            f"color:{UI_COLORS['text']}; font-weight:bold;")
         self.clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row2.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
@@ -833,6 +939,7 @@ class MainWindow(QWidget):
 
         # Progress: status line + (bar + speed)
         self.status = QLabel("就绪")
+        self.status.setWordWrap(True)
         self.status.setTextInteractionFlags(Qt.TextSelectableByMouse)
         root.addWidget(self.status)
         prog_row = QHBoxLayout()
@@ -886,6 +993,10 @@ class MainWindow(QWidget):
         # 数据集总览 (KPI cards, 4 per row)
         self.kpi_labels = {}
         kpi_grid = QGridLayout()
+        kpi_grid.setHorizontalSpacing(8)
+        kpi_grid.setVerticalSpacing(8)
+        for column in range(4):
+            kpi_grid.setColumnStretch(column, 1)
         for i, (key, title, hl) in enumerate(self.KPI_CARDS):
             kpi_grid.addWidget(self._make_card(key, title, hl), i // 4, i % 4)
         n = len(self.KPI_CARDS)
@@ -894,6 +1005,7 @@ class MainWindow(QWidget):
 
         self.baseline_hint = QLabel("")
         self.baseline_hint.setStyleSheet("color: #888; font-size: 12px;")
+        self.baseline_hint.setWordWrap(True)
         lv.addWidget(self.baseline_hint)
 
         # Filter box
@@ -922,9 +1034,10 @@ class MainWindow(QWidget):
         for i in range(1, len(TABLE_COLS)):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         hdr.setStretchLastSection(True)
-        self.table.setColumnWidth(0, 440)
+        self.table.setColumnWidth(0, self.dataset_column_width)
         lv.addWidget(self.table, 1)
         self.table_hint = QLabel("点「仅拉取统计信息」加载数据集列表(双击行打开 HF 页面)。")
+        self.table_hint.setWordWrap(True)
         lv.addWidget(self.table_hint)
 
         # ===== RIGHT: 数据集检查分区 =====
@@ -1257,6 +1370,7 @@ class MainWindow(QWidget):
     def _make_card(self, key, title, highlight=False):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
+        card.setMinimumHeight(78)
         if highlight:
             # 总小时数 — the key metric, visually distinct.
             card.setStyleSheet(
@@ -1269,8 +1383,9 @@ class MainWindow(QWidget):
             else "color:#666; font-size:12px;")
         val = QLabel("—")
         val.setStyleSheet(
-            "font-size:26px; font-weight:bold; color:#2e7d32;" if highlight
-            else "font-size:22px; font-weight:bold;")
+            "font-size:19pt; font-weight:bold; color:#2e7d32;" if highlight
+            else "font-size:17pt; font-weight:bold;")
+        val.setWordWrap(True)
         val.setTextInteractionFlags(Qt.TextSelectableByMouse)
         cv.addWidget(t)
         cv.addWidget(val)
@@ -1281,15 +1396,18 @@ class MainWindow(QWidget):
         """Special card: today's top contributor (by new hours) + their tallies."""
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
+        card.setMinimumHeight(78)
         cv = QVBoxLayout(card)
         t = QLabel("今日 MVP ⭐")
         t.setStyleSheet("color: #666; font-size: 12px;")
         self.mvp_name_lbl = QLabel("—")
         self.mvp_name_lbl.setStyleSheet(
-            "font-size: 22px; font-weight: bold; color:#F9A825;")
+            "font-size:17pt; font-weight:bold; color:#B54708;")
+        self.mvp_name_lbl.setWordWrap(True)
         self.mvp_name_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
         self.mvp_sub_lbl = QLabel("")
         self.mvp_sub_lbl.setStyleSheet("color:#888; font-size: 11px;")
+        self.mvp_sub_lbl.setWordWrap(True)
         cv.addWidget(t)
         cv.addWidget(self.mvp_name_lbl)
         cv.addWidget(self.mvp_sub_lbl)
@@ -1390,7 +1508,7 @@ class MainWindow(QWidget):
         for i in range(1, len(TABLE_COLS)):
             ehdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
         ehdr.setStretchLastSection(True)
-        self.edit_table.setColumnWidth(0, 380)
+        self.edit_table.setColumnWidth(0, max(280, self.dataset_column_width - 40))
         lv.addWidget(self.edit_table, 1)
         split.addWidget(left)
 
@@ -1969,7 +2087,7 @@ class MainWindow(QWidget):
         v = QVBoxLayout(w)
 
         self.viewer_status = QLabel("")
-        self.viewer_status.setStyleSheet("font-size: 15px;")
+        self.viewer_status.setStyleSheet("font-size:11pt; font-weight:bold;")
         v.addWidget(self.viewer_status)
         self.viewer_detail = QLabel("")
         self.viewer_detail.setStyleSheet("color: #888; font-size: 12px;")
@@ -2049,8 +2167,9 @@ class MainWindow(QWidget):
         extra = f" · 可见数据集 {self._viewer_count}" if self._viewer_count is not None else ""
 
         # Toolbar controls (canonical).
-        self.top_viewer_dot.setText(
-            f'<span style="color:{color}">●</span> Viewer: {text} · {st["port"]}')
+        self.top_viewer_dot.setText(f'<span style="color:{color}">●</span> Viewer')
+        self.top_viewer_dot.setToolTip(
+            f"Viewer: {text} · 端口 {st['port']}\n{st['url'] or '服务未启动'}")
         self.top_viewer_start.setEnabled(not st["running"])
         self.top_viewer_stop.setEnabled(st["managed"])
         self.top_viewer_home.setEnabled(st["ready"])
@@ -3403,6 +3522,7 @@ APP_ID = "tacverse-workbench"  # WM class / desktop-file base name (taskbar matc
 
 def main():
     app = QApplication(sys.argv)
+    configure_application_ui(app)
     # Taskbar/dock icon: an app-level icon plus a stable WM class that matches an
     # installed <APP_ID>.desktop, so GNOME/Ubuntu show the logo instead of the
     # generic gear. (setWindowIcon on the window alone is not enough on Linux.)
