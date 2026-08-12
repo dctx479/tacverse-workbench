@@ -27,31 +27,64 @@
 
 ## 环境安装
 
-### 1. Python 环境
+本项目支持 Windows、Ubuntu/Linux 和 macOS，使用 Python 3.10 或更高版本。
+**不要求创建或激活虚拟环境**：系统 Python、conda/mamba 环境或 `venv` 均可。安装依赖和启动程序时使用同一个 Python 解释器即可。
 
-推荐统一使用 `lerobot-xense`（mamba/conda）环境：
+### 1. 准备 Python 与 Git
 
-```bash
-mamba activate lerobot-xense
+检查当前解释器：
+
+```powershell
+# Windows PowerShell（也可使用 PATH 中的 python）
+py -3 --version
+git --version
 ```
 
-### 2. Python 依赖
-
 ```bash
-pip install "huggingface_hub" PySide6 pyqtgraph pyarrow
+# Ubuntu / macOS
+python3 --version
+git --version
 ```
 
-> `pyarrow` 用于读/写数据集的 `meta/*.parquet`（「数据集编辑」页签改 prompt 时会写回）；
-> 上传编辑后的副本用已有的 `huggingface_hub`。在 `lerobot-xense` 环境里这些通常已安装。
->
-> **务必在 `lerobot-xense` 环境里启动**（`mamba activate lerobot-xense && python main_app.py`）。
-> 「数据集编辑」页签里的 **删除/拆分/合并/增删特征** 会以子进程方式调用 lerobot 官方
-> `dataset_tools`，因此需要该环境里的 `lerobot` 包；改名 / 改 prompt 则是本地 pyarrow 实现，
-> 不依赖 lerobot。
+- Windows：可从 [python.org](https://www.python.org/downloads/windows/) 安装 64 位 Python；安装后若没有 `py` 命令，可将下文的 `py -3` 换成 `python`。
+- Ubuntu：如未安装，执行 `sudo apt update && sudo apt install -y python3 python3-pip git`。
+- macOS：可使用系统已有的 Python 3，或执行 `brew install python git`。不使用 Homebrew 时也可从 python.org 安装。
 
-### 3. 系统依赖（Linux 必装 ⚠️）
+如果是首次克隆仓库，建议同时拉取 Viewer 子模块：
 
-PySide6 6.5+ 的 Qt xcb 平台插件需要 `libxcb-cursor0`，**缺了会直接报错无法启动**：
+```bash
+git clone --recurse-submodules https://github.com/dctx479/tacverse-workbench.git
+```
+
+已经克隆的仓库可在项目根目录补拉子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
+### 2. 安装基础依赖
+
+```powershell
+# Windows PowerShell
+py -3 -m pip install --upgrade pip
+py -3 -m pip install huggingface_hub PySide6 pyqtgraph pyarrow
+```
+
+```bash
+# Ubuntu / macOS
+python3 -m pip install --upgrade pip
+python3 -m pip install huggingface_hub PySide6 pyqtgraph pyarrow
+```
+
+这些依赖足以运行 GUI、拉取统计信息以及使用改名 / 改 Prompt 功能。使用 `python -m pip` 的形式可以确保依赖安装到实际启动程序的解释器中。
+
+> 某些 Linux 发行版会限制向系统 Python 安装包。如果 `pip` 提示 `externally-managed-environment`，请使用发行版提供的 Python 包、conda/mamba，或自行选择 `venv`；这不是本项目的强制要求。
+
+### 3. 平台依赖
+
+Windows 和 macOS 通常无需额外的 GUI 系统库。
+
+Ubuntu/Linux 上，PySide6 6.5+ 的 Qt xcb 平台插件需要 `libxcb-cursor0`。缺少时会报错并无法启动：
 
 ```
 From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb platform plugin.
@@ -64,7 +97,48 @@ sudo apt update
 sudo apt install -y libxcb-cursor0
 ```
 
-> 之前有同事反馈起不来，基本都是缺这个系统库。装上即可。
+如果仍提示缺少 xcb 库，请根据报错用当前 Linux 发行版的包管理器安装对应库；无桌面环境的服务器还需要 X11/Wayland 会话才能显示 GUI。
+
+### 4. 可选功能依赖
+
+基础工作台不依赖以下组件，只在使用对应功能时安装。
+
+**本地视频质量检查与图表：**
+
+```powershell
+# Windows PowerShell
+py -3 -m pip install opencv-python imageio-ffmpeg matplotlib
+```
+
+```bash
+# Ubuntu / macOS
+python3 -m pip install opencv-python imageio-ffmpeg matplotlib
+```
+
+**删除 / 拆分 / 合并 / 增删特征：** 这些操作调用 LeRobot 官方 `dataset_tools`，因此需要在启动工作台的同一个解释器中安装 `lerobot`。
+
+```powershell
+# Windows PowerShell
+py -3 -m pip install lerobot
+py -3 -c "import lerobot; print('lerobot ready')"
+```
+
+```bash
+# Ubuntu / macOS
+python3 -m pip install lerobot
+python3 -c "import lerobot; print('lerobot ready')"
+```
+
+**Viewer：** 需要仓库子模块、[Bun](https://bun.sh/) 和前端依赖。安装 Bun 后，在项目根目录执行：
+
+```bash
+git submodule update --init --recursive
+cd vendor/lerobot_viewer
+bun install
+cd ../..
+```
+
+上述 `cd` 和 `bun` 命令在 Windows PowerShell、Ubuntu 与 macOS 中通用。Viewer 未安装时，其他页签仍可正常使用。
 
 ---
 
@@ -81,21 +155,32 @@ TacVerse 的大部分数据集是**私有**的。HF 接口只会返回「当前 
 
 - **方式 A（推荐，一次生效）**：命令行登录，程序会自动读取缓存的登录 token：
   ```bash
-  huggingface-cli login      # 粘贴上面的 Read token
+  hf auth login              # Windows / Ubuntu / macOS 通用
   ```
-- **方式 B（临时）**：设置环境变量后启动：
+- **方式 B（临时）**：设置环境变量后启动。Windows PowerShell：
+  ```powershell
+  $env:HF_TOKEN = "hf_你的token"
+  py -3 main_app.py
+  ```
+  Ubuntu / macOS：
   ```bash
   export HF_TOKEN=hf_你的token
-  python main_app.py
+  python3 main_app.py
   ```
 - **方式 C（运行时）**：直接开 GUI，点顶栏 **「切换账号」** 粘贴 token。
 
-程序取 token 的优先级：`$HF_TOKEN` → `huggingface-cli login` 缓存 → 匿名。
+程序取 token 的优先级：`HF_TOKEN` 环境变量 → `hf auth login` 缓存 → 匿名。
 
 ### 验证 token 是否有权限
 
+```powershell
+# Windows PowerShell
+py -3 -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVerse/taccap-g1-candybowl-0702').private)"
+```
+
 ```bash
-python -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVerse/taccap-g1-candybowl-0702').private)"
+# Ubuntu / macOS
+python3 -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVerse/taccap-g1-candybowl-0702').private)"
 ```
 能打印 `True` 说明有权限；报 `404` 说明账号 / token 权限不够（需组织管理员把你的账号加进组织，或换经典 Read token）。启动 GUI 后，顶栏指示器显示的「可见 N 个」也能直接反映权限是否正确。
 
@@ -103,18 +188,38 @@ python -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVer
 
 ## 用法
 
+以下命令均在项目根目录执行。
+
 ### 命令行（批量拉取整个组织）
 
+Windows PowerShell：
+
+```powershell
+py -3 download_dataset.py                                # 拉取默认组织全部数据集
+py -3 download_dataset.py --org TacVerse                 # 指定组织
+py -3 download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
+```
+
+Ubuntu / macOS：
+
 ```bash
-python download_dataset.py                                # 拉取默认组织全部数据集
-python download_dataset.py --org <ORG>                    # 指定组织
-python download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
+python3 download_dataset.py                                # 拉取默认组织全部数据集
+python3 download_dataset.py --org TacVerse                 # 指定组织
+python3 download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
 ```
 
 ### 图形界面（团队看板）
 
+Windows PowerShell：
+
+```powershell
+py -3 main_app.py
+```
+
+Ubuntu / macOS：
+
 ```bash
-python main_app.py
+python3 main_app.py
 ```
 
 进去后：点 **「仅拉取统计信息」**（快，只读信息，不下载）、**「下载当前选中数据集」**（只下选中的一个，省时）或 **「拉取组织及其下所有数据集」**（全量下载 + 累积历史，较慢）。
