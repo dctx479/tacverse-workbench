@@ -3,6 +3,10 @@
 # root file ./dataset_log.json instead, so a clone gets history without datasets/.
 datasets/
 pulls/
+quality_status.local.json
+.quality_cache/
+.quality_reports/
+**/quality_clips/
 
 # Python virtual env / caches
 .venv/

@@ -26,6 +26,7 @@
 - **PICO MoTracker 轨迹检查**：在右侧「检查规则」中点击按钮后，针对当前已下载数据集按固定阈值扫描 `left_tcp` / `right_tcp` 的相邻帧；同时检查单轴位移和 XYZ 三维位移，并按 Episode 展示帧号、时间、变化量和命中的阈值。该扫描不会随切换数据集自动启动。
 - **Viewer Doctor 诊断**：右侧「数据集检查分区」可切换到 Doctor 页面，调用 vendored viewer 的 TypeScript 诊断接口；支持前 N 个、全部或自定义 Episode 范围，流式显示进度，按 PASS/WARN/FAIL 展开检查结果，并可导出 JSON 报告。Doctor 与 Workbench 的 PICO 固定阈值检查相互独立。
 - **双行功能工具栏**：顶部操作按职责分为两行。第一行集中 `数据源 / 数据获取 / 数据维护`，提供组织选择、刷新统计、下载选中、同步全部、检查新增、手动补录和数据目录；第二行集中 `账号 / Viewer / 目标`，显示登录状态、Viewer 服务控制、打开选中数据集、每日小时目标和当前时间。完整操作说明可通过按钮 tooltip 查看。
+- **Episode 深度质量检查**：手动扫描本地数据集，或按需缓存远程检查文件；定位首尾位姿偏差、轨迹突变、长时间静止、时长离群、画面闪烁/模糊/曝光/冻结和 JPEG 日志异常。检查在后台运行并支持取消，生成 Markdown / HTML / CSV / JSON 报告、问题视频切片和逐自由度轨迹图；问题可标记为确认、误报或已修复。触觉相机不会套用普通相机的模糊和冻结规则。
 - **登录状态指示器**：顶栏实时显示「已登录: xxx · 可见 N 个数据集」，一眼判断 token 权限是否正确（私有库需要有权限的账号才可见）。
 - **切换账号**：顶栏按钮，运行时粘贴新的 HF token 即可切换（仅本次运行有效，不落盘）。
 
@@ -44,11 +45,13 @@ mamba activate lerobot-xense
 ### 2. Python 依赖
 
 ```bash
-pip install "huggingface_hub" PySide6 pyqtgraph pyarrow
+pip install "huggingface_hub" PySide6 pyqtgraph pyarrow opencv-python matplotlib imageio-ffmpeg
 ```
 
 > `pyarrow` 用于读/写数据集的 `meta/*.parquet`（「数据集编辑」页签改 prompt 时会写回）；
 > 上传编辑后的副本用已有的 `huggingface_hub`。在 `lerobot-xense` 环境里这些通常已安装。
+> Episode 深度质量检查用 OpenCV 解码视频，用 Matplotlib 生成轨迹图；视频切片优先调用
+> 系统 `ffmpeg` 转成浏览器可播放的 H.264，未安装时会回退到 `imageio-ffmpeg`。
 >
 > **务必在 `lerobot-xense` 环境里启动**（`mamba activate lerobot-xense && python main_app.py`）。
 > 「数据集编辑」页签里的 **删除/拆分/合并/增删特征** 会以子进程方式调用 lerobot 官方
@@ -245,6 +248,7 @@ Doctor 由 `third_party/lerobot_viewer` 提供，Workbench 通过 viewer 的 HTT
 - `main_app.py` —— PySide6 团队看板（GUI 入口）。
 - `download_dataset.py` —— 拉取 / 统计 / 分析 / 配置读写的核心逻辑（CLI 与 GUI 共用）。
 - `checks.py` —— 数据集质量检查插件注册表（命名 / 均时长 / Prompt 等规则）。
+- `dataset_quality.py` —— Qt-free Episode 深度质量扫描、问题切片、报告和复核状态持久化。
 - `pico_motracker.py` —— Qt-free PICO MoTracker 固定阈值轨迹跳变检测器。
 - `dataset_editor.py` —— 「改名 / 改 Prompt」的本地 pyarrow 实现（Qt-free，不依赖 lerobot）。
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。

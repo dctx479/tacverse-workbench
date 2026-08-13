@@ -41,6 +41,18 @@ DEFAULTS = {
             "（", "）", "“", "”", "‘", "’", "《", "》", "—", "·",
         ],
     },
+    "local_quality": {
+        "start_end_window": 10,
+        "boundary_mad_factor": 6.0,
+        "boundary_abs_threshold": 0.20,
+        "jump_mad_factor": 14.0,
+        "jump_abs_threshold": 0.35,
+        "flicker_sample_step": 3,
+        "flicker_luma_threshold": 45.0,
+        "flicker_recover_ratio": 0.45,
+        "max_video_frames": 12000,
+        "max_issues": 80,
+    },
 }
 
 
@@ -151,6 +163,47 @@ def _check_prompt(dataset, cfg):
     status = FAIL if worst >= _SEVERITY[FAIL] else WARN
     details = [line for _, line in all_findings]
     return status, f"{len(all_findings)} 项待改", details
+
+
+@register("episode_local_quality", "Episode 级质量定位", provider="local_quality")
+def _check_local_quality(dataset, cfg):
+    """Run the heavy local/remote scanner only when explicitly requested."""
+    import dataset_quality
+
+    issues = dataset_quality.scan_dataset(
+        dataset, out_dir="datasets/TacVerse",
+        cfg=_cfg(cfg, "local_quality"))
+    return format_local_quality_issues(issues)
+
+
+def format_local_quality_issues(issues):
+    """Convert dataset_quality Issue objects to one CheckResult payload."""
+    actionable = [x for x in issues if x.severity in (WARN, FAIL)]
+    skipped = [x for x in issues if x.severity == SKIP]
+    if not actionable:
+        if skipped:
+            return SKIP, skipped[0].message, [x.message for x in skipped[1:]]
+        return OK, "未发现 episode 级异常", []
+
+    worst = max((_SEVERITY.get(x.severity, 0) for x in actionable), default=0)
+    status = FAIL if worst >= _SEVERITY[FAIL] else WARN
+    details = []
+    for issue in actionable:
+        parts = []
+        if issue.episode_index is not None:
+            parts.append(f"episode {issue.episode_index}")
+        if issue.start_sec is not None and issue.end_sec is not None:
+            parts.append(f"{issue.start_sec:.3f}s-{issue.end_sec:.3f}s")
+        elif issue.frame_index is not None:
+            parts.append(f"frame {issue.frame_index}")
+        if issue.field:
+            parts.append(issue.field)
+        prefix = " / ".join(parts)
+        line = f"{prefix}: {issue.message}" if prefix else issue.message
+        if issue.clip_path:
+            line += f" | video切片: {issue.clip_path}"
+        details.append(line)
+    return status, f"{len(actionable)} 项 episode 级问题", details
 
 
 # --- runner + aggregation ---------------------------------------------------
