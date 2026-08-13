@@ -640,6 +640,7 @@ class DownloadOneWorker(QThread):
     """Download a single selected dataset (not the whole org) to save time."""
 
     done = Signal(str)   # local_dir of the downloaded dataset
+    log = Signal(str)
     error = Signal(str)
 
     def __init__(self, repo_id, out_dir, token):
@@ -651,7 +652,10 @@ class DownloadOneWorker(QThread):
             dd.normalize_proxy_env()
             day_dir = Path(self.out_dir) / dt.datetime.now().strftime("%y%m%d")
             day_dir.mkdir(parents=True, exist_ok=True)
-            dd.pull_dataset(self.repo_id, day_dir, revision=None, token=self.token)
+            dd.pull_dataset(
+                self.repo_id, day_dir, revision=None, token=self.token,
+                log=self.log.emit,
+            )
             self.done.emit(str(day_dir / self.repo_id.split("/")[-1]))
         except Exception as exc:
             self.error.emit(str(exc))
@@ -2317,15 +2321,14 @@ class MainWindow(QWidget):
 
     # ---- Viewer tab (vendored xense_lerobot_viewer, black-box service) ---- #
     def _viewer_root(self):
-        """The dataset root the viewer scans (contract ①): the latest pull-date
-        folder under pulls/ (so it shows the most recent pull, without the
-        per-date duplicates you'd get by pointing at pulls/ itself). Falls back
-        to pulls/ when there are no date folders yet."""
-        base = Path(OUT_DIR)
-        dates = sorted((p for p in base.glob("*")
-                        if p.is_dir() and p.name.isdigit()),
-                       key=lambda p: p.name)
-        return str((dates[-1] if dates else base).resolve())
+        """The stable root containing every dated dataset pull.
+
+        The viewer discovers datasets recursively, so binding it to ``pulls/``
+        exposes ``pulls/<date>/<dataset>`` from every pull date.  Keeping this
+        root stable also lets datasets downloaded after viewer startup appear
+        without rebinding the service to a newer date directory.
+        """
+        return str(Path(OUT_DIR).resolve())
 
     def _build_viewer_tab(self):
         """Reserved space for the viewer: service status + controls.
@@ -2378,7 +2381,7 @@ class MainWindow(QWidget):
 
     def _viewer_start(self):
         if not self.viewer.available():
-            msg = f"viewer 未就绪：请在 {self.viewer.viewer_dir} 执行 bun install"
+            msg = f"Viewer 未就绪：请在 {self.viewer.viewer_dir} 执行 bun install"
             self.viewer_detail.setText(msg)
             self.status.setText(msg)
             return
@@ -2388,26 +2391,33 @@ class MainWindow(QWidget):
         self._refresh_viewer_status()
 
     def _viewer_stop(self):
-        self.viewer.stop()
+        ok, msg = self.viewer.stop()
         self._viewer_count = None
-        self.status.setText("Viewer 已停止")
+        self.status.setText(msg)
+        if not ok:
+            QMessageBox.warning(self, "Viewer 关闭失败", msg)
         self._refresh_viewer_status()
 
     def _viewer_open_home(self):
-        if not self.viewer.is_running():
-            self.status.setText("Viewer 未启动：请先点「启动 Viewer」")
+        if not self.viewer.is_ready():
+            self.status.setText("Viewer 尚未就绪：请先启动并等待状态变为运行中")
             return
         self.viewer.open_home()
         self.status.setText(f"已打开首页: {self.viewer.home_url()}")
 
     def _refresh_viewer_status(self):
         st = self.viewer.status()
-        if not st["running"]:
-            color, text = "#c62828", "未启动"
-        elif st["ready"]:
+        state = st.get("state", "stopped")
+        if state == "ready":
             color, text = "#2e7d32", "运行中"
-        else:
+        elif state == "starting":
             color, text = "#F9A825", "启动中…"
+        elif state == "conflict":
+            color, text = "#c62828", "端口冲突"
+        elif state == "error":
+            color, text = "#c62828", "启动失败"
+        else:
+            color, text = "#667085", "已停止"
 
         # Refresh the dataset count occasionally (every ~6s) to avoid hammering
         # the discovery API on every tick.
@@ -2420,9 +2430,11 @@ class MainWindow(QWidget):
 
         # Toolbar controls (canonical).
         self.top_viewer_dot.setText(f'<span style="color:{color}">●</span> Viewer')
+        detail = st.get("error") or (
+            f'数据根: {st.get("actual_root") or st["root"] or self._viewer_root()}')
         self.top_viewer_dot.setToolTip(
-            f"Viewer: {text} · 端口 {st['port']}\n{st['url'] or '服务未启动'}")
-        self.top_viewer_start.setEnabled(not st["running"])
+            f"Viewer: {text} · 端口 {st['port']}\n{detail}")
+        self.top_viewer_start.setEnabled(state in {"stopped", "error", "conflict"})
         self.top_viewer_stop.setEnabled(st["managed"])
         self.top_viewer_home.setEnabled(st["ready"])
 
@@ -2431,8 +2443,9 @@ class MainWindow(QWidget):
             self.viewer_status.setText(
                 f'<span style="color:{color}">●</span> Viewer: {text} · 端口 {st["port"]}')
             self.viewer_detail.setText(
-                f'数据根: {st["root"] or self._viewer_root()}{extra}   ({st["url"]})')
-            self.viewer_start_btn.setEnabled(not st["running"])
+                f'{detail}{extra}   ({st["url"]})')
+            self.viewer_start_btn.setEnabled(
+                state in {"stopped", "error", "conflict"})
             self.viewer_stop_btn.setEnabled(st["managed"])
             self.viewer_home_btn.setEnabled(st["ready"])
 
@@ -2441,8 +2454,8 @@ class MainWindow(QWidget):
         if not d:
             self.status.setText("请先在左侧选中一个数据集")
             return
-        if not self.viewer.is_running():
-            self.status.setText("Viewer 未启动：请到「Viewer」页点「启动 Viewer」")
+        if not self.viewer.is_ready():
+            self.status.setText("Viewer 尚未就绪：请先启动并等待状态变为运行中")
             return
         rel = self.viewer.dataset_rel_path(d, root=self._viewer_root())
         if not rel:
@@ -3096,12 +3109,12 @@ class MainWindow(QWidget):
         take tens of seconds); cached per session; stale selections ignored."""
         self._report_seq += 1
         seq = self._report_seq
-        if not self.viewer.is_running():
-            self._report_set_note("Viewer 未运行；顶栏点「启动」后显示分析。")
+        if not self.viewer.is_ready():
+            self._report_set_note("Viewer 尚未就绪；顶栏点「启动」后显示分析。")
             return
         rel = self.viewer.dataset_rel_path(d, root=self._viewer_root())
         if not rel:
-            self._report_set_note("该数据集不在 Viewer 数据根（最新拉取日），暂无分析。")
+            self._report_set_note("该数据集不在 Viewer 数据根，暂无分析。")
             return
         cached = self._report_cache.get(rel)
         if cached is not None:
@@ -3699,6 +3712,7 @@ class MainWindow(QWidget):
         self.speed_timer.start()
         self.status.setText(f"开始下载 {repo_id} ...")
         self.dl_worker = DownloadOneWorker(repo_id, OUT_DIR, self.token)
+        self.dl_worker.log.connect(self.status.setText)
         self.dl_worker.done.connect(self._on_download_one_done)
         self.dl_worker.error.connect(self._on_error)
         self.dl_worker.start()

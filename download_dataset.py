@@ -18,6 +18,8 @@ import datetime as dt
 import json
 import os
 import sys
+import threading
+import time
 from pathlib import Path
 
 # By default every dataset under this org is discovered and pulled. Override
@@ -40,6 +42,10 @@ INFO_FIELDS = [
 
 # Assumed capture rate (frames per second) when a dataset's info.json omits fps.
 DEFAULT_FPS = 30
+
+# Serialize Workbench snapshot calls so a single pull and a batch pull cannot
+# target the same dated directory at the same time.
+_SNAPSHOT_LOCK = threading.RLock()
 
 
 def normalize_proxy_env() -> None:
@@ -210,20 +216,61 @@ def fetch_uploader(repo_id, token=None):
     }
 
 
-def pull_dataset(repo_id, day_dir, revision, token):
-    """Download one dataset into <day_dir>/<dataset-name> and summarize it."""
+def _is_local_cache_temp_error(exc):
+    """Whether an exception is a recoverable local_dir temp-file failure."""
+    if not isinstance(exc, FileNotFoundError):
+        return False
+    path = str(getattr(exc, "filename", "") or exc).replace("\\", "/").lower()
+    return "/.cache/huggingface/download/" in path and ".incomplete" in path
+
+
+def _hub_local_dir(local_dir):
+    """Use Win32's extended path form for Hub cache files over MAX_PATH."""
+    path = str(Path(local_dir).resolve())
+    if os.name != "nt" or path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path.lstrip("\\")
+    return "\\\\?\\" + path
+
+
+def _snapshot_to_local(repo_id, revision, local_dir, token, *, max_workers):
     from huggingface_hub import snapshot_download
 
-    local_dir = Path(day_dir) / repo_id.split("/")[-1]
-    print(f"Downloading {repo_id} -> {local_dir}")
-    path = snapshot_download(
+    return snapshot_download(
         repo_id=repo_id,
         repo_type="dataset",
         revision=revision,
-        local_dir=str(local_dir),
+        local_dir=_hub_local_dir(local_dir),
         token=token,
+        max_workers=max_workers,
     )
-    return build_summary(repo_id, path)
+
+
+def pull_dataset(repo_id, day_dir, revision, token, log=print):
+    """Download one dataset into <day_dir>/<dataset-name> and summarize it."""
+    local_dir = Path(day_dir) / repo_id.split("/")[-1]
+    log(f"Downloading {repo_id} -> {local_dir}")
+    attempts = [
+        (8, None),
+        (1, "检测到缓存临时文件异常，正在单线程续传…"),
+    ]
+    with _SNAPSHOT_LOCK:
+        for index, (workers, retry_message) in enumerate(attempts):
+            if retry_message:
+                log(retry_message)
+                time.sleep(0.25)
+            try:
+                path = _snapshot_to_local(
+                    repo_id, revision, local_dir, token,
+                    max_workers=workers,
+                )
+                break
+            except Exception as exc:
+                if not _is_local_cache_temp_error(exc) or \
+                        index == len(attempts) - 1:
+                    raise
+    return build_summary(repo_id, str(local_dir))
 
 
 def build_report(summaries, failures, now, org, requested):
@@ -268,7 +315,7 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
     for i, repo_id in enumerate(repo_ids, 1):
         log(f"[{i}/{total}] {repo_id}")
         try:
-            s = pull_dataset(repo_id, day_dir, revision, token)
+            s = pull_dataset(repo_id, day_dir, revision, token, log=log)
             _enrich(s, repo_id, meta_map, with_uploader, token)
             summaries.append(s)
         except Exception as exc:  # keep pulling the rest if one fails
