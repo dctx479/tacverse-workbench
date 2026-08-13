@@ -19,6 +19,7 @@ import signal
 import socket
 import subprocess
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
@@ -216,6 +217,57 @@ class ViewerService:
         if isinstance(data, dict) and data.get("ok") is False:
             return None, str(data.get("error") or "analysis failed")
         return data, None
+
+    def doctor(self, rel_path, max_episodes=25, episode_range=None,
+               checks=None, timeout=300, on_progress=None):
+        """Run the viewer's TypeScript Doctor endpoint.
+
+        The endpoint streams newline-delimited JSON progress events followed by
+        one result event.  This method stays Qt-free and reports progress via
+        ``on_progress(progress_dict)`` so the GUI can run it in a worker thread.
+        Returns ``(result_dict, None)`` on success or ``(None, error)``.
+        """
+        url = (f"{self.base_url}/api/local-datasets/"
+               f"{encode_dataset_path(rel_path)}/doctor?stream=1")
+        payload = {
+            "maxEpisodes": max_episodes,
+            "episodeRange": episode_range,
+        }
+        if checks is not None:
+            payload["checks"] = checks
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                result = None
+                for raw_line in resp:
+                    if not raw_line.strip():
+                        continue
+                    event = json.loads(raw_line.decode("utf-8"))
+                    kind = event.get("type") if isinstance(event, dict) else None
+                    if kind == "progress":
+                        if on_progress:
+                            on_progress(event.get("progress") or {})
+                    elif kind == "result":
+                        result = event.get("result")
+                    elif kind == "error":
+                        return None, str(event.get("error") or "Doctor failed")
+                if result is None:
+                    return None, "Doctor stream ended without a result"
+                return result, None
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                message = body.get("error") if isinstance(body, dict) else None
+            except Exception:
+                message = None
+            return None, str(message or f"HTTP {exc.code}")
+        except Exception as exc:
+            return None, str(exc)
 
     def status(self):
         running = self.is_running()

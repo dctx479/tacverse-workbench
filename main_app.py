@@ -31,7 +31,7 @@ from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget,
-    QListWidgetItem, QMessageBox, QProgressBar, QPushButton, QScrollArea,
+    QListWidgetItem, QMessageBox, QFileDialog, QProgressBar, QPushButton, QScrollArea,
     QSpinBox, QStackedWidget,
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -415,6 +415,34 @@ class PicoMotrackerWorker(QThread):
             self.done.emit(self.seq, str(self.dataset_dir.resolve()), None, str(exc))
 
 
+class DoctorWorker(QThread):
+    """Run the viewer Doctor stream away from the Qt UI thread."""
+
+    progress = Signal(int, str)
+    done = Signal(int, str, object, str)  # seq, dataset key, result|None, error
+
+    def __init__(self, viewer, rel_path, options, seq):
+        super().__init__()
+        self.viewer, self.rel_path = viewer, rel_path
+        self.options, self.seq = options, seq
+
+    def run(self):
+        def emit_progress(progress):
+            percent = int(progress.get("overall_percent", 0) or 0)
+            message = str(progress.get("message") or "Doctor running…")
+            self.progress.emit(percent, message)
+
+        result, error = self.viewer.doctor(
+            self.rel_path,
+            max_episodes=self.options.get("maxEpisodes"),
+            episode_range=self.options.get("episodeRange"),
+            checks=self.options.get("checks"),
+            timeout=300,
+            on_progress=emit_progress,
+        )
+        self.done.emit(self.seq, self.rel_path, result, error or "")
+
+
 class EditWorker(QThread):
     """Write an edited copy of a pulled dataset off the UI thread: hard-link the
     heavy payload into a new dir, then rewrite the prompt in its metadata."""
@@ -600,6 +628,9 @@ class MainWindow(QWidget):
         self._pico_workers = []     # in-flight opt-in trajectory scans
         self._pico_seq = 0
         self._pico_cache = {}       # dataset path -> DetectionResult or error tuple
+        self._doctor_workers = []
+        self._doctor_seq = 0
+        self._doctor_cache = {}     # (rel_path, scope) -> Doctor response
         # 数据集编辑 state: the dataset being edited, its prompt editors, and the
         # last copy written (so 推送到 Hub knows what to upload). Workers held on
         # self so they are not GC'd mid-run.
@@ -644,32 +675,64 @@ class MainWindow(QWidget):
     def _build_ui(self):
         root = QVBoxLayout(self)
 
-        top = FlowLayout(hspacing=6, vspacing=4)
+        # The toolbar is intentionally split into two functional rows.  The
+        # first row contains data acquisition/maintenance actions; the second
+        # row contains account, Viewer and status controls.  Keeping status
+        # widgets out of the action row prevents long identity text and the
+        # clock from forcing the primary buttons into an unclear wrap order.
+        toolbar = QVBoxLayout()
+        toolbar.setSpacing(3)
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+
+        def separator(layout):
+            line = QFrame()
+            line.setFrameShape(QFrame.VLine)
+            line.setFrameShadow(QFrame.Sunken)
+            layout.addWidget(line)
+
+        def section_label(text, layout):
+            label = QLabel(text)
+            label.setStyleSheet("color:#666; font-size:11px; font-weight:bold;")
+            layout.addWidget(label)
+
         if LOGO_PATH.is_file():
             logo = QLabel()
             logo.setPixmap(QPixmap(str(LOGO_PATH)).scaledToHeight(
                 30, Qt.SmoothTransformation))
             logo.setToolTip("TacVerse")
-            top.addWidget(logo)
-        top.addWidget(QLabel("组织:"))
+            row1.addWidget(logo)
+        section_label("数据源", row1)
+        row1.addWidget(QLabel("组织:"))
         self.org_combo = QComboBox()
         self.org_combo.setEditable(True)
         self.org_combo.addItems(RECENT_ORGS)
         self.org_combo.setMinimumWidth(160)
         self.org_combo.currentIndexChanged.connect(self._refresh_identity)
         self.org_combo.lineEdit().editingFinished.connect(self._refresh_identity)
-        top.addWidget(self.org_combo)
+        row1.addWidget(self.org_combo)
 
-        # Three primary actions, in increasing cost: stats-only (fast) ->
-        # download just the selected dataset -> pull the whole org (slow). Each
-        # gets a bold colored look; a small 2nd line spells out the trade-off.
-        # The utilities that follow stay plain, behind a vertical divider.
-        self.btn_stats = QPushButton("仅拉取统计信息\n（不下载数据集）")
-        self.btn_download = QPushButton("下载当前选中数据集")
-        self.btn_pull = QPushButton("拉取组织及其下所有数据集\n（速度较慢）")
-        self.btn_check = QPushButton("检查新增数据集")
-        self.btn_manual_stats = QPushButton("手动补录统计")
-        self.btn_open = QPushButton("打开本地目录")
+        separator(row1)
+        section_label("数据获取", row1)
+        self.btn_stats = QPushButton("刷新统计")
+        self.btn_stats.setToolTip("仅获取数据集元信息，不下载 Parquet 和视频，速度最快。")
+        self.btn_download = QPushButton("下载选中")
+        self.btn_download.setToolTip("下载当前表格中选中的一个数据集。")
+        self.btn_pull = QPushButton("同步全部")
+        self.btn_pull.setToolTip("下载当前组织下全部数据集，速度较慢并占用磁盘空间。")
+        for button in (self.btn_stats, self.btn_download, self.btn_pull):
+            row1.addWidget(button)
+
+        separator(row1)
+        section_label("数据维护", row1)
+        self.btn_check = QPushButton("检查新增")
+        self.btn_check.setToolTip("检查 Hub 中新增或本地缺失的数据集。")
+        self.btn_manual_stats = QPushButton("手动补录")
+        self.btn_manual_stats.setToolTip("手动补录某一天的数据集统计快照。")
+        self.btn_open = QPushButton("数据目录")
+        self.btn_open.setToolTip("打开本地 datasets/TacVerse/ 目录。")
         self.btn_stats.clicked.connect(self.on_stats)
         self.btn_download.clicked.connect(self.on_download_selected)
         self.btn_pull.clicked.connect(self.on_pull)
@@ -678,7 +741,7 @@ class MainWindow(QWidget):
         self.btn_open.clicked.connect(self.on_open_dir)
 
         primary_css = (
-            "QPushButton { font-weight: bold; padding: 5px 14px; border-radius: 6px;"
+            "QPushButton { font-weight: bold; padding: 6px 13px; border-radius: 6px;"
             " color: white; background: %s; }"
             "QPushButton:hover { background: %s; }"
             "QPushButton:disabled { background: #B0B0B0; }"
@@ -687,34 +750,45 @@ class MainWindow(QWidget):
         self.btn_download.setStyleSheet(primary_css % ("#F59E0B", "#D98A00"))
         self.btn_pull.setStyleSheet(primary_css % ("#4C8BF5", "#3B7AE0"))
         secondary_css = (
-            "QPushButton { padding: 5px 12px; border-radius: 6px; color: #444;"
+            "QPushButton { padding: 6px 11px; border-radius: 6px; color: #444;"
             " border: 1px solid #C4C4C4; background: #F5F5F5; }"
             "QPushButton:hover { background: #ECECEC; }"
         )
         for b in (self.btn_stats, self.btn_download, self.btn_pull):
-            b.setMinimumHeight(42)
-            top.addWidget(b)
-        divider = QFrame()
-        divider.setFrameShape(QFrame.VLine)
-        divider.setFrameShadow(QFrame.Sunken)
-        top.addWidget(divider)
+            b.setMinimumHeight(34)
+            b.setStyleSheet(primary_css % (
+                "#34A853" if b is self.btn_stats else
+                "#F59E0B" if b is self.btn_download else "#4C8BF5",
+                "#2E9247" if b is self.btn_stats else
+                "#D98A00" if b is self.btn_download else "#3B7AE0"))
         for b in (self.btn_check, self.btn_manual_stats, self.btn_open):
             b.setStyleSheet(secondary_css)
-            top.addWidget(b)
+            row1.addWidget(b)
 
-        # Viewer service controls, up here in the toolbar (the "Viewer" tab is
-        # kept for now but may be removed later — these are the canonical ones).
-        vdiv = QFrame()
-        vdiv.setFrameShape(QFrame.VLine)
-        vdiv.setFrameShadow(QFrame.Sunken)
-        top.addWidget(vdiv)
+        row1.addStretch(1)
+
+        # Account and visibility status are kept together on the second row.
+        section_label("账号", row2)
+        self.btn_account = QPushButton("切换账号")
+        self.btn_account.setStyleSheet(secondary_css)
+        self.btn_account.setToolTip("切换 Hugging Face 账号或更新访问令牌。")
+        self.btn_account.clicked.connect(self.on_switch_account)
+        row2.addWidget(self.btn_account)
+        self.identity_label = QLabel("登录状态: 检测中…")
+        self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.identity_label.setStyleSheet("color:#888;")
+        self.identity_label.setMinimumWidth(245)
+        row2.addWidget(self.identity_label)
+
+        separator(row2)
+        section_label("Viewer", row2)
         self.top_viewer_dot = QLabel("● Viewer")
         self.top_viewer_dot.setToolTip("Viewer 服务状态")
-        top.addWidget(self.top_viewer_dot)
+        row2.addWidget(self.top_viewer_dot)
         self.top_viewer_start = QPushButton("启动")
         self.top_viewer_stop = QPushButton("停止")
         self.top_viewer_home = QPushButton("首页")
-        self.open_viewer_btn = QPushButton("🔍 在 Viewer 打开")
+        self.open_viewer_btn = QPushButton("打开选中")
         self.open_viewer_btn.setToolTip("在浏览器的 Viewer 里打开选中的数据集")
         self.top_viewer_start.clicked.connect(self._viewer_start)
         self.top_viewer_stop.clicked.connect(self._viewer_stop)
@@ -723,38 +797,31 @@ class MainWindow(QWidget):
         for b in (self.top_viewer_start, self.top_viewer_stop,
                   self.top_viewer_home, self.open_viewer_btn):
             b.setStyleSheet(secondary_css)
-            top.addWidget(b)
+            row2.addWidget(b)
 
-        top.addWidget(QLabel("每日目标(小时):"))
+        separator(row2)
+        section_label("目标", row2)
+        row2.addWidget(QLabel("每日小时:"))
         self.target_spin = QSpinBox()
         self.target_spin.setRange(0, 100000)
         self.target_spin.setValue(10)
         self.target_spin.valueChanged.connect(self._refresh_kpis)
-        top.addWidget(self.target_spin)
-        self.btn_account = QPushButton("切换账号")
-        self.btn_account.setStyleSheet(secondary_css)
-        self.btn_account.clicked.connect(self.on_switch_account)
-        top.addWidget(self.btn_account)
-        # Login / visibility indicator — surfaces token & org-permission problems
-        # (e.g. "未登录(匿名) · TacVerse 可见 11 个") without any digging.
-        self.identity_label = QLabel("登录状态: 检测中…")
-        self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.identity_label.setStyleSheet("color:#888;")
-        top.addWidget(self.identity_label)
+        self.target_spin.setFixedWidth(72)
+        self.target_spin.setToolTip("用于计算看板中的每日目标完成度。")
+        row2.addWidget(self.target_spin)
 
-        # Live clock, far right.
-        sep = QFrame()
-        sep.setFrameShape(QFrame.VLine)
-        sep.setFrameShadow(QFrame.Sunken)
-        top.addWidget(sep)
+        row2.addStretch(1)
         self.clock_label = QLabel("")
         self.clock_label.setStyleSheet("color:#444; font-weight:bold;")
-        top.addWidget(self.clock_label)
+        self.clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        row2.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
         self.clock_timer.timeout.connect(self._tick_clock)
         self.clock_timer.start(1000)
         self._tick_clock()
-        root.addLayout(top)
+        toolbar.addLayout(row1)
+        toolbar.addLayout(row2)
+        root.addLayout(toolbar)
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard_tab(), "看板")
@@ -919,6 +986,23 @@ class MainWindow(QWidget):
         self.report_progress.setVisible(False)
         pv.addWidget(self.report_progress)
 
+        mode_row = QHBoxLayout()
+        mode_row.addWidget(QLabel("右侧视图:"))
+        self.data_check_mode_button = QPushButton("数据检查")
+        self.doctor_mode_button = QPushButton("Doctor")
+        for button in (self.data_check_mode_button, self.doctor_mode_button):
+            button.setCheckable(True)
+            button.setAutoExclusive(True)
+        self.data_check_mode_button.setChecked(True)
+        self.data_check_mode_button.clicked.connect(
+            lambda: self._set_detail_mode("checks"))
+        self.doctor_mode_button.clicked.connect(
+            lambda: self._set_detail_mode("doctor"))
+        mode_row.addWidget(self.data_check_mode_button)
+        mode_row.addWidget(self.doctor_mode_button)
+        mode_row.addStretch(1)
+        pv.addLayout(mode_row)
+
         # --- grid of viewer-mirroring panels --------------------------------
         self.detail_grid = QWidget()
         grid = QGridLayout(self.detail_grid)
@@ -1057,7 +1141,11 @@ class MainWindow(QWidget):
         il.addWidget(self.insight_view, 1)
         grid.addWidget(insight_box, 2, 0)
 
-        pv.addWidget(self.detail_grid, 1)
+        self.detail_stack = QStackedWidget()
+        self.detail_stack.addWidget(self.detail_grid)
+        self.doctor_panel = self._build_doctor_panel()
+        self.detail_stack.addWidget(self.doctor_panel)
+        pv.addWidget(self.detail_stack, 1)
 
         # --- Fallback: nothing selected -------------------------------------
         self.prompt_empty = QLabel("选择左侧数据集查看信息。")
@@ -1069,6 +1157,102 @@ class MainWindow(QWidget):
         self._prompt_doc = {"episodes": {}, "updated_at": None}
         self._show_prompt_empty("选择左侧数据集查看信息。")
         return panel
+
+    def _set_detail_mode(self, mode):
+        """Switch the right-side detail area between checks and Doctor."""
+        if mode == "doctor":
+            self.detail_stack.setCurrentWidget(self.doctor_panel)
+        else:
+            self.detail_stack.setCurrentWidget(self.detail_grid)
+
+    def _build_doctor_panel(self):
+        panel = QWidget()
+        layout = QVBoxLayout(panel)
+        layout.setContentsMargins(0, 0, 0, 0)
+
+        title = QLabel("Doctor 数据集诊断")
+        title.setStyleSheet("font-size:16px; font-weight:bold; color:#2e7d32;")
+        layout.addWidget(title)
+        self.doctor_dataset_label = QLabel("请选择已下载的数据集")
+        self.doctor_dataset_label.setStyleSheet("color:#777;")
+        self.doctor_dataset_label.setWordWrap(True)
+        layout.addWidget(self.doctor_dataset_label)
+
+        controls = QHBoxLayout()
+        controls.addWidget(QLabel("检查范围:"))
+        self.doctor_scope = QComboBox()
+        self.doctor_scope.addItem("前 25 个 Episode", {"maxEpisodes": 25})
+        self.doctor_scope.addItem("前 50 个 Episode", {"maxEpisodes": 50})
+        self.doctor_scope.addItem("前 100 个 Episode", {"maxEpisodes": 100})
+        self.doctor_scope.addItem("全部 Episode", {"maxEpisodes": None})
+        self.doctor_scope.addItem("自定义 Episode 范围", {"episodeRange": True})
+        self.doctor_scope.currentIndexChanged.connect(self._doctor_scope_changed)
+        controls.addWidget(self.doctor_scope, 1)
+        self.doctor_range_start = QSpinBox()
+        self.doctor_range_start.setRange(0, 1_000_000)
+        self.doctor_range_start.setValue(0)
+        self.doctor_range_start.setPrefix("起始 ")
+        self.doctor_range_start.setVisible(False)
+        controls.addWidget(self.doctor_range_start)
+        self.doctor_range_end = QSpinBox()
+        self.doctor_range_end.setRange(0, 1_000_000)
+        self.doctor_range_end.setValue(25)
+        self.doctor_range_end.setPrefix("结束 ")
+        self.doctor_range_end.setVisible(False)
+        controls.addWidget(self.doctor_range_end)
+        self.doctor_run_button = QPushButton("运行 Doctor")
+        self.doctor_run_button.clicked.connect(self._start_doctor)
+        controls.addWidget(self.doctor_run_button)
+        self.doctor_export_button = QPushButton("导出 JSON")
+        self.doctor_export_button.setEnabled(False)
+        self.doctor_export_button.clicked.connect(self._export_doctor)
+        controls.addWidget(self.doctor_export_button)
+        layout.addLayout(controls)
+
+        self.doctor_progress = QProgressBar()
+        self.doctor_progress.setRange(0, 100)
+        self.doctor_progress.setValue(0)
+        self.doctor_progress.setFormat("未运行")
+        layout.addWidget(self.doctor_progress)
+        self.doctor_status = QLabel("Doctor 只在点击按钮后运行。")
+        self.doctor_status.setStyleSheet("color:#888; font-size:11px;")
+        self.doctor_status.setWordWrap(True)
+        layout.addWidget(self.doctor_status)
+
+        summary = QHBoxLayout()
+        self.doctor_pass = QLabel("PASS 0")
+        self.doctor_warn = QLabel("WARN 0")
+        self.doctor_fail = QLabel("FAIL 0")
+        self.doctor_pass.setStyleSheet("color:#2e7d32; font-weight:bold;")
+        self.doctor_warn.setStyleSheet("color:#ef8c00; font-weight:bold;")
+        self.doctor_fail.setStyleSheet("color:#c62828; font-weight:bold;")
+        summary.addWidget(self.doctor_pass)
+        summary.addWidget(self.doctor_warn)
+        summary.addWidget(self.doctor_fail)
+        summary.addStretch(1)
+        layout.addLayout(summary)
+
+        self.doctor_tree = self._panel_tree()
+        self.doctor_tree.setRootIsDecorated(True)
+        self.doctor_tree.setWordWrap(True)
+        layout.addWidget(self.doctor_tree, 1)
+        return panel
+
+    def _doctor_scope_changed(self, _index):
+        custom = bool((self.doctor_scope.currentData() or {}).get("episodeRange"))
+        self.doctor_range_start.setVisible(custom)
+        self.doctor_range_end.setVisible(custom)
+
+    def _doctor_scope_options(self):
+        selected = dict(self.doctor_scope.currentData() or {"maxEpisodes": 25})
+        if selected.pop("episodeRange", False):
+            start = self.doctor_range_start.value()
+            end = max(start, self.doctor_range_end.value())
+            selected = {
+                "maxEpisodes": None,
+                "episodeRange": {"start": start, "end": end},
+            }
+        return selected
 
     def _make_card(self, key, title, highlight=False):
         card = QFrame()
@@ -2129,7 +2313,7 @@ class MainWindow(QWidget):
         """Show only the centered fallback label (nothing selected)."""
         self.prompt_empty.setText(msg)
         self.prompt_empty.setVisible(True)
-        self.detail_grid.setVisible(False)
+        self.detail_stack.setVisible(False)
         self.report_progress.setVisible(False)
 
     def _on_dataset_selected(self):
@@ -2149,7 +2333,7 @@ class MainWindow(QWidget):
         # Checks run off the record itself (name / duration / prompt), so the
         # panel is useful for any selected row even before a full pull.
         self.prompt_empty.setVisible(False)
-        self.detail_grid.setVisible(True)
+        self.detail_stack.setVisible(True)
 
         self._pico_seq += 1  # invalidate a scan belonging to a previous row
 
@@ -2158,6 +2342,7 @@ class MainWindow(QWidget):
         agg = self._refresh_checks(d)
         self._refresh_episode_lengths(d)
         self._refresh_report(d)
+        self._refresh_doctor_selection(d)
 
         bits = [f"数据集: {name}", f"{n_tasks} 条指令"]
         if anno_path:
@@ -2165,6 +2350,143 @@ class MainWindow(QWidget):
         if agg["n_fail"] or agg["n_warn"]:
             bits.append(f"检查 {chk_mod.badge(agg)[0]}")
         self.prompt_meta.setText(" · ".join(bits))
+
+    def _doctor_dataset_key(self, d):
+        """Return the viewer-relative path used by the Doctor API."""
+        return self.viewer.dataset_rel_path(d, root=self._viewer_root())
+
+    def _refresh_doctor_selection(self, d):
+        """Reset or restore the opt-in Doctor result for the selected dataset."""
+        self._doctor_seq += 1
+        name = (d.get("dataset_name") or "").split("/")[-1]
+        rel = self._doctor_dataset_key(d)
+        self.doctor_dataset_label.setText(
+            f"数据集: {name}" if rel else "该数据集不在 Viewer 数据根，无法运行 Doctor")
+        self.doctor_run_button.setEnabled(bool(rel and self.viewer.is_running()))
+        self.doctor_export_button.setEnabled(False)
+        self.doctor_progress.setValue(0)
+        self.doctor_progress.setFormat("未运行")
+        self.doctor_tree.clear()
+        self.doctor_status.setText(
+            "Doctor 只在点击按钮后运行。" if rel
+            else "请先下载数据集并确保 Viewer 数据根可访问。")
+        self.doctor_current_result = None
+        if not rel:
+            return
+        scope = self._doctor_scope_options()
+        cache_key = (rel, json.dumps(scope, sort_keys=True))
+        cached = self._doctor_cache.get(cache_key)
+        if cached is not None:
+            self._render_doctor(cached)
+
+    def _start_doctor(self):
+        """Start an explicit Doctor run for the selected local dataset."""
+        dataset = self._selected_dataset()
+        if not dataset:
+            self.doctor_status.setText("请先选择数据集")
+            return
+        rel = self._doctor_dataset_key(dataset)
+        if not rel:
+            self.doctor_status.setText("该数据集不在 Viewer 数据根")
+            return
+        if not self.viewer.is_running():
+            self.doctor_status.setText("Viewer 未运行，请先启动 Viewer")
+            return
+        scope = self._doctor_scope_options()
+        cache_key = (rel, json.dumps(scope, sort_keys=True))
+        self._doctor_seq += 1
+        seq = self._doctor_seq
+        self.doctor_run_button.setEnabled(False)
+        self.doctor_export_button.setEnabled(False)
+        self.doctor_progress.setValue(0)
+        self.doctor_progress.setFormat("%p%")
+        self.doctor_status.setText("正在启动 Doctor…")
+        worker = DoctorWorker(self.viewer, rel, scope, seq)
+        worker.progress.connect(self._on_doctor_progress)
+        worker.done.connect(
+            lambda done_seq, key, result, error:
+            self._on_doctor_done(done_seq, key, result, error, cache_key))
+        self._doctor_workers.append(worker)
+        worker.start()
+
+    def _on_doctor_progress(self, percent, message):
+        self.doctor_progress.setValue(max(0, min(100, percent)))
+        self.doctor_progress.setFormat(f"{percent}%")
+        self.doctor_status.setText(message)
+
+    def _on_doctor_done(self, seq, rel, result, error, cache_key):
+        self._doctor_workers = [worker for worker in self._doctor_workers
+                                if worker.isRunning()]
+        if result is not None:
+            self._doctor_cache[cache_key] = result
+        if seq != self._doctor_seq:
+            return
+        current = self._selected_dataset()
+        current_rel = self._doctor_dataset_key(current) if current else None
+        if current_rel != rel:
+            return
+        self.doctor_run_button.setEnabled(bool(current_rel))
+        if error:
+            self.doctor_progress.setFormat("失败")
+            self.doctor_status.setText(f"Doctor 失败: {error}")
+            self.doctor_current_result = None
+            return
+        self._render_doctor(result)
+
+    @staticmethod
+    def _doctor_icon(severity):
+        return {"PASS": "✅", "WARN": "⚠️", "FAIL": "❌"}.get(severity, "—")
+
+    def _render_doctor(self, result):
+        """Render a Doctor response as an expandable tree."""
+        self.doctor_current_result = result
+        self.doctor_export_button.setEnabled(True)
+        self.doctor_progress.setValue(100)
+        self.doctor_progress.setFormat("完成")
+        report = (result or {}).get("report") or {}
+        execution = (result or {}).get("execution") or {}
+        summary = report.get("summary") or {}
+        self.doctor_pass.setText(f"PASS {summary.get('PASS', 0)}")
+        self.doctor_warn.setText(f"WARN {summary.get('WARN', 0)}")
+        self.doctor_fail.setText(f"FAIL {summary.get('FAIL', 0)}")
+        loaded = execution.get("loaded_episode_count")
+        duration = execution.get("duration_ms")
+        self.doctor_status.setText(
+            f"诊断完成：加载 {loaded} 个 Episode"
+            + (f"，耗时 {duration / 1000:.1f}s" if isinstance(duration, (int, float)) else ""))
+        self.doctor_tree.clear()
+        for check in report.get("checks") or []:
+            severity = check.get("severity", "WARN")
+            messages = check.get("messages") or []
+            item = QTreeWidgetItem([
+                f"{self._doctor_icon(severity)} {check.get('name', 'Doctor check')}"
+                f" · {severity} · {len(messages)} 条信息"
+            ])
+            self.doctor_tree.addTopLevelItem(item)
+            for message in messages:
+                child_severity = message.get("severity", severity)
+                child = QTreeWidgetItem([
+                    f"{self._doctor_icon(child_severity)} {message.get('message', '')}"
+                ])
+                child.setToolTip(0, child.text(0))
+                item.addChild(child)
+            item.setExpanded(severity != "PASS")
+
+    def _export_doctor(self):
+        if not self.doctor_current_result:
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出 Doctor 报告", "doctor-report.json", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            Path(path).write_text(
+                json.dumps(self.doctor_current_result, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self.doctor_status.setText(f"报告已导出: {path}")
+        except OSError as exc:
+            self.doctor_status.setText(f"导出失败: {exc}")
 
     def _refresh_checks(self, d):
         """Populate the 检查 tree (grouped by provider). Returns the aggregate."""
