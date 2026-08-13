@@ -44,6 +44,7 @@ import viewer_service as vsvc
 import download_dataset as dd
 import dataset_editor as de
 import episode_lengths as ep_len
+import pico_motracker as pico
 import lerobot_ops as lops
 
 DATASETS_ROOT = "datasets"
@@ -395,6 +396,25 @@ class ReportWorker(QThread):
         self.done.emit(self.seq, self.rel_path, report, err or "")
 
 
+class PicoMotrackerWorker(QThread):
+    """Run the opt-in local PICO MoTracker scan away from the Qt UI thread."""
+
+    done = Signal(int, str, object, str)  # seq, dataset key, result|None, error
+
+    def __init__(self, dataset_dir, cfg, seq):
+        super().__init__()
+        self.dataset_dir = Path(dataset_dir)
+        self.cfg = cfg
+        self.seq = seq
+
+    def run(self):
+        try:
+            result = pico.detect(self.dataset_dir, self.cfg)
+            self.done.emit(self.seq, str(self.dataset_dir.resolve()), result, "")
+        except Exception as exc:
+            self.done.emit(self.seq, str(self.dataset_dir.resolve()), None, str(exc))
+
+
 class EditWorker(QThread):
     """Write an edited copy of a pulled dataset off the UI thread: hard-link the
     heavy payload into a new dir, then rewrite the prompt in its metadata."""
@@ -577,6 +597,9 @@ class MainWindow(QWidget):
         self._report_workers = []   # in-flight ReportWorkers
         self._report_seq = 0        # only the latest selection's report renders
         self._report_cache = {}     # rel_path -> report dict (per session)
+        self._pico_workers = []     # in-flight opt-in trajectory scans
+        self._pico_seq = 0
+        self._pico_cache = {}       # dataset path -> DetectionResult or error tuple
         # 数据集编辑 state: the dataset being edited, its prompt editors, and the
         # last copy written (so 推送到 Hub knows what to upload). Workers held on
         # self so they are not GC'd mid-run.
@@ -990,6 +1013,15 @@ class MainWindow(QWidget):
         rules_box = QGroupBox("检查规则")
         rules_box.setStyleSheet(green_box_css)
         rul = QVBoxLayout(rules_box)
+        pico_row = QHBoxLayout()
+        self.pico_check_button = QPushButton("检查 PICO MoTracker 轨迹")
+        self.pico_check_button.clicked.connect(self._start_pico_check)
+        pico_row.addWidget(self.pico_check_button)
+        self.pico_check_status = QLabel("未检测")
+        self.pico_check_status.setStyleSheet("color:#888; font-size:11px;")
+        self.pico_check_status.setWordWrap(True)
+        pico_row.addWidget(self.pico_check_status, 1)
+        rul.addLayout(pico_row)
         self.check_tree = self._panel_tree()
         self.check_tree.setRootIsDecorated(True)
         rul.addWidget(self.check_tree, 1)
@@ -2119,6 +2151,8 @@ class MainWindow(QWidget):
         self.prompt_empty.setVisible(False)
         self.detail_grid.setVisible(True)
 
+        self._pico_seq += 1  # invalidate a scan belonging to a previous row
+
         n_tasks = self._refresh_tasks(inline_tasks, task_path)
         n_anno_eps, total_eps = self._refresh_annotations(anno_path)
         agg = self._refresh_checks(d)
@@ -2159,7 +2193,116 @@ class MainWindow(QWidget):
                     node.addChild(QTreeWidgetItem([det]))
                 node.setExpanded(True)
             parent.setExpanded(True)
+
+        dataset_dir = self._dataset_dir(d)
+        self.pico_check_button.setEnabled(dataset_dir is not None)
+        dataset_key = str(dataset_dir.resolve()) if dataset_dir else None
+        cached = self._pico_cache.get(dataset_key) if dataset_key else None
+        if cached:
+            result, error = cached
+            self._render_pico_result(result, error)
+        else:
+            self.pico_check_status.setText(
+                "未检测（点击按钮开始）" if dataset_dir else "未下载本地数据，无法检测")
         return agg
+
+    def _start_pico_check(self):
+        """Start an explicit PICO scan for the currently selected dataset."""
+        dataset = self._selected_dataset()
+        dataset_dir = self._dataset_dir(dataset)
+        if dataset_dir is None:
+            self.pico_check_status.setText("当前数据集未下载到本地")
+            return
+        key = str(dataset_dir.resolve())
+        self._pico_seq += 1
+        seq = self._pico_seq
+        self.pico_check_button.setEnabled(False)
+        self.pico_check_status.setText("检测中…")
+        self._pico_cache.pop(key, None)
+        worker = PicoMotrackerWorker(
+            dataset_dir,
+            _CHECKS_CFG.get("pico_motracker", {}),
+            seq,
+        )
+        worker.done.connect(self._on_pico_check_done)
+        self._pico_workers.append(worker)
+        worker.start()
+
+    def _on_pico_check_done(self, seq, key, result, error):
+        self._pico_workers = [worker for worker in self._pico_workers
+                              if worker.isRunning()]
+        if result is None:
+            self._pico_cache[key] = (None, error)
+        else:
+            self._pico_cache[key] = (result, "")
+        if seq != self._pico_seq:
+            return
+        current = self._selected_dataset()
+        current_dir = self._dataset_dir(current)
+        current_key = str(current_dir.resolve()) if current_dir else None
+        if current_key != key:
+            return
+        self.pico_check_button.setEnabled(current_dir is not None)
+        self._render_pico_result(result, error)
+
+    def _render_pico_result(self, result, error=""):
+        """Render trajectory events as expandable Episode/event tree nodes."""
+        # Remove a previous PICO result while retaining the ordinary rules.
+        for index in range(self.check_tree.topLevelItemCount() - 1, -1, -1):
+            item = self.check_tree.topLevelItem(index)
+            if item.data(0, Qt.UserRole) == "pico_motracker":
+                self.check_tree.takeTopLevelItem(index)
+        if error:
+            self.pico_check_status.setText(f"检测失败: {error}")
+            return
+        if result is None:
+            return
+        if result.total_events == 0:
+            self.pico_check_status.setText(
+                f"未发现超过阈值的跳变（扫描 {result.scanned_transitions:,} 个帧间隔）")
+            parent = QTreeWidgetItem(["✅ PICO MoTracker 轨迹：未发现异常"])
+            parent.setData(0, Qt.UserRole, "pico_motracker")
+            self.check_tree.addTopLevelItem(parent)
+            return
+
+        self.pico_check_status.setText(
+            f"发现 {result.total_events} 个事件，涉及 {len(result.affected_episodes)} 个 Episode")
+        parent = QTreeWidgetItem([
+            f"❌ PICO MoTracker 轨迹：{result.total_events} 个异常事件，"
+            f"{len(result.affected_episodes)} 个 Episode"
+        ])
+        parent.setData(0, Qt.UserRole, "pico_motracker")
+        self.check_tree.addTopLevelItem(parent)
+        by_episode = {}
+        for event in result.events:
+            by_episode.setdefault(event.episode_index, []).append(event)
+        for episode_index, events in sorted(by_episode.items()):
+            ep_item = QTreeWidgetItem([
+                f"Episode {episode_index}（{len(events)} 个事件）"])
+            parent.addChild(ep_item)
+            for event in events:
+                hit_parts = []
+                for axis in event.axis_hits:
+                    hit_parts.append(
+                        f"{axis} Δ{event.deltas[axis]:+.3f} "
+                        f"(阈值 {result.thresholds['axis_step_threshold'][axis]:.3f})")
+                if event.xyz_hit:
+                    hit_parts.append(
+                        f"XYZ {event.xyz_step:.3f} "
+                        f"(阈值 {result.thresholds['xyz_step_threshold']:.3f})")
+                line = QTreeWidgetItem([
+                    f"{event.hand}_tcp · frame {event.previous_frame}→{event.frame_index} · "
+                    f"{event.previous_time:.3f}–{event.timestamp:.3f}s · "
+                    + ", ".join(hit_parts)
+                ])
+                line.setToolTip(0, line.text(0))
+                ep_item.addChild(line)
+            ep_item.setExpanded(False)
+        if result.truncated:
+            parent.addChild(QTreeWidgetItem([
+                f"其余事件未展开（详情上限 {result.thresholds['max_event_details']}）"
+            ]))
+        parent.setExpanded(True)
 
     def _set_episode_length_note(self, message):
         """Show a single muted status row in the episode-length tree."""

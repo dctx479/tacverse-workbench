@@ -23,6 +23,7 @@
   - **Episode 时长定位**：选中已下载的数据集后，检查面板中的 `STATISTICS` 会按时长区间列出 episode 数量；展开区间即可查看具体 `ep`、实际秒数和 frames，用于快速定位过短或过长的数据。
   - **检查面板布局**：左侧依次显示 `ANNOTATIONS`、`FILTERING`、`ACTION INSIGHTS`，右侧显示 `STATISTICS` 和 `检查规则`；统计概要默认折叠，Episode 时长明细优先显示。
 - **质量检查**：命名规范、均时长（20~600s）、Prompt 词数（10~50 词）等规则内置，看板表格用 ✅/⚠️/❌ 标注；阈值在 `config.json` 的 `checks` 段可调。
+- **PICO MoTracker 轨迹检查**：在右侧「检查规则」中点击按钮后，针对当前已下载数据集按固定阈值扫描 `left_tcp` / `right_tcp` 的相邻帧；同时检查单轴位移和 XYZ 三维位移，并按 Episode 展示帧号、时间、变化量和命中的阈值。该扫描不会随切换数据集自动启动。
 - **登录状态指示器**：顶栏实时显示「已登录: xxx · 可见 N 个数据集」，一眼判断 token 权限是否正确（私有库需要有权限的账号才可见）。
 - **切换账号**：顶栏按钮，运行时粘贴新的 HF token 即可切换（仅本次运行有效，不落盘）。
 
@@ -148,6 +149,34 @@ Workbench 不显示直方图，而是直接提供可展开的时长分组：
 
 该信息来自本地 `meta/episodes` 元数据，按 viewer 相同的分组规则计算。此功能目前针对已下载的 LeRobot v3 数据集；仅统计、未下载或缺少 episode 元数据时，界面会显示原因。
 
+### PICO MoTracker 轨迹检查
+
+选中一个已下载的数据集，在右侧「检查规则」中点击 **检查 PICO MoTracker 轨迹**。结果按以下层级展开：
+
+```text
+❌ PICO MoTracker 轨迹：5 个异常事件，2 个 Episode
+  Episode 0（3 个事件）
+    right_tcp · frame 3752→3753 · 125.067–125.100s · x Δ-1.339，XYZ 1.502
+```
+
+当前只启用固定阈值的两项标准：
+
+- 单轴单帧跳变：`abs(Δx)`、`abs(Δy)` 或 `abs(Δz)` 达到对应阈值；
+- XYZ 三维跳变：`sqrt(Δx² + Δy² + Δz²)` 达到三维阈值。
+
+阈值位于 `config.json` 的 `checks.pico_motracker`：
+
+```json
+"pico_motracker": {
+  "source": "observation.state",
+  "hands": ["left", "right"],
+  "axis_step_threshold": {"x": 0.2, "y": 0.2, "z": 0.2},
+  "xyz_step_threshold": 0.35
+}
+```
+
+修改配置后重启 Workbench；当前版本暂不提供图形化阈值设置窗口，也不包含自适应阈值、恢复形态或加速度标准。
+
 ### 数据集编辑（生成新副本，不改动原数据）
 
 在 **「数据集编辑」** 页签，左表选中一个**已下载**的数据集（未下载的行不能编辑；可先用「下载当前选中数据集」拉下来）。所有操作都**输出为新副本**到 `datasets/<组织名>/<输出名>/`，**不会改动原数据集**。
@@ -189,6 +218,7 @@ Workbench 不显示直方图，而是直接提供可展开的时长分组：
 - `main_app.py` —— PySide6 团队看板（GUI 入口）。
 - `download_dataset.py` —— 拉取 / 统计 / 分析 / 配置读写的核心逻辑（CLI 与 GUI 共用）。
 - `checks.py` —— 数据集质量检查插件注册表（命名 / 均时长 / Prompt 等规则）。
+- `pico_motracker.py` —— Qt-free PICO MoTracker 固定阈值轨迹跳变检测器。
 - `dataset_editor.py` —— 「改名 / 改 Prompt」的本地 pyarrow 实现（Qt-free，不依赖 lerobot）。
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。
 - `config.json` —— 上传者中文名映射 + 质量检查阈值。

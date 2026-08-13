@@ -31,6 +31,20 @@
         "—",
         "·"
       ]
+    },
+    "pico_motracker": {
+      "source": "observation.state",
+      "hands": [
+        "left",
+        "right"
+      ],
+      "axis_step_threshold": {
+        "x": 0.2,
+        "y": 0.2,
+        "z": 0.2
+      },
+      "xyz_step_threshold": 0.35,
+      "max_event_details": 1000
     }
   },
   "uploader_names": {
