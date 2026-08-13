@@ -32,10 +32,9 @@ def available():
         return False
 
 
-def default_out_dir(new_leaf, out_dir="pulls", today=None):
-    """pulls/<%y%m%d>/<new_leaf>/ — same date layout as pulls and dataset_editor."""
-    stamp = (today or _dt.date.today()).strftime("%y%m%d")
-    return Path(out_dir) / stamp / new_leaf
+def default_out_dir(new_leaf, out_dir="datasets/TacVerse", today=None):
+    """Return an organization-rooted output path with no date subdirectory."""
+    return Path(out_dir) / new_leaf
 
 
 def run_op(spec, log=None):

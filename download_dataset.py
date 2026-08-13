@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Pull one or more Hugging Face dataset repos into date-stamped folders.
+"""Pull one or more Hugging Face dataset repos into an organization folder.
 
 Datasets are re-pulled on every run (`snapshot_download` syncs incrementally,
 so newly merged files are fetched and unchanged ones are skipped). Each run
-writes everything under a per-day folder:
+stores each dataset directly under the configured organization folder:
 
-    <out-dir>/<YYMMDD>/<dataset-name>/...             # dataset files
-    <out-dir>/<YYMMDD>/pull_result_<YYMMDD>_<HHMM>.json  # aggregate summary
+    <out-dir>/<dataset-name>/...                       # dataset files
+    <out-dir>/pull_result_<YYMMDD>_<HHMMSS>.json      # aggregate summary
 
 The list of datasets lives in DATASETS and can be overridden with repeated
 `--repo-id` flags. The fields lifted from each dataset's meta/info.json are
@@ -209,11 +209,11 @@ def fetch_uploader(repo_id, token=None):
     }
 
 
-def pull_dataset(repo_id, day_dir, revision, token):
-    """Download one dataset into <day_dir>/<dataset-name> and summarize it."""
+def pull_dataset(repo_id, dataset_dir, revision, token):
+    """Download one dataset into <dataset_dir>/<dataset-name> and summarize it."""
     from huggingface_hub import snapshot_download
 
-    local_dir = Path(day_dir) / repo_id.split("/")[-1]
+    local_dir = Path(dataset_dir) / repo_id.split("/")[-1]
     print(f"Downloading {repo_id} -> {local_dir}")
     path = snapshot_download(
         repo_id=repo_id,
@@ -250,15 +250,15 @@ def build_report(summaries, failures, now, org, requested):
 def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
              log=print, progress=None, write_summary=True,
              meta_map=None, with_uploader=True):
-    """Pull every repo in `repo_ids` into a per-day folder and write a report.
+    """Pull every repo in `repo_ids` into one organization folder and write a report.
 
     `log(msg)` receives human-readable progress lines (same text as the CLI).
     `progress(done, total)` is called before and after each dataset so a UI can
     drive a progress bar. Returns (report_dict, out_path_or_None).
     """
     now = now or dt.datetime.now()
-    day_dir = Path(out_dir) / now.strftime("%y%m%d")
-    day_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = Path(out_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
 
     summaries, failures = [], []
     total = len(repo_ids)
@@ -267,7 +267,7 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
     for i, repo_id in enumerate(repo_ids, 1):
         log(f"[{i}/{total}] {repo_id}")
         try:
-            s = pull_dataset(repo_id, day_dir, revision, token)
+            s = pull_dataset(repo_id, dataset_dir, revision, token)
             _enrich(s, repo_id, meta_map, with_uploader, token)
             summaries.append(s)
         except Exception as exc:  # keep pulling the rest if one fails
@@ -279,11 +279,11 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
     report = build_report(summaries, failures, now, org, total)
     out_path = None
     if write_summary:
-        out_path = day_dir / f"pull_result_{now.strftime('%y%m%d_%H%M')}.json"
+        out_path = dataset_dir / f"pull_result_{now.strftime('%y%m%d_%H%M%S')}.json"
         out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log(f"Wrote summary -> {out_path}")
     try:
-        append_pull(report)  # git-committed change-log; survives pulls/ being ignored
+        append_pull(report)  # git-committed change-log; survives datasets/ being ignored
         log(f"Updated history -> {DATASET_LOG_FILE}")
     except OSError as exc:
         log(f"WARN: could not update {DATASET_LOG_FILE}: {exc}")
@@ -327,8 +327,10 @@ def collect_stats(repo_ids, org, token=None, now=None, log=print, progress=None,
 
 
 def find_latest_report(out_dir):
-    """Return the newest pull_result_*.json under out_dir/*/ (or None)."""
-    files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
+    """Return the newest pull_result_*.json directly under an org directory."""
+    files = sorted(Path(out_dir).glob("pull_result_*.json"))
+    if not files:
+        files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
     return files[-1] if files else None
 
 
@@ -337,7 +339,7 @@ def find_latest_report(out_dir):
 # --------------------------------------------------------------------------- #
 # Two git-committed json files at the repo root, both travelling with the code so
 # a fresh clone gets the collection trend / 每日新增 WITHOUT syncing the multi-GB
-# pulls/ folder (which is .gitignore'd):
+# datasets/ folder (which is .gitignore'd):
 #
 #   config.json       — hand-edited only:
 #                        { "checks": {...}, "uploader_names": {"<hf_id>": "<中文名>"} }
@@ -746,14 +748,17 @@ def load_history(out_dir, log_file=DATASET_LOG_FILE):
     """Load pull snapshots oldest-first for trends / deltas.
 
     Reconstructs the committed snapshots from the dataset change-log and merges
-    them with any local pulls/*/pull_result_*.json still on disk, deduping by
+    them with any local pull_result_*.json still on disk, deduping by
     pulled_at so both sources contribute but neither double-counts.
     """
     by_at = {}
     for r in _reconstruct_history(load_dataset_log(log_file)):
         key = (r.get("pulled_at") or id(r), r.get("org"))
         by_at[key] = r
-    for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
+    files = sorted(Path(out_dir).glob("pull_result_*.json"))
+    if not files:
+        files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
+    for f in files:
         try:
             r = json.loads(f.read_text())
         except (OSError, ValueError):
@@ -907,7 +912,7 @@ def rollup(datasets, key_fn):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pull HF datasets into date-stamped folders."
+        description="Pull HF datasets into one organization dataset folder."
     )
     parser.add_argument(
         "--org",
@@ -923,8 +928,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--out-dir",
-        default="pulls",
-        help="Base directory; a per-day <YYMMDD> subfolder is created inside",
+        default="datasets/TacVerse",
+        help="Organization dataset directory; datasets are stored directly inside",
     )
     parser.add_argument("--revision", default=None, help="Branch, tag, or commit")
     parser.add_argument(

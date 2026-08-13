@@ -42,12 +42,12 @@ STYLE_ORDER = ["task_aug", "subtask", "plan", "memory", "interjection", "vqa", N
 _EVENT_STYLES = {"interjection", "vqa", None}
 
 
-def resolve_path(dataset, out_dir="pulls"):
+def resolve_path(dataset, out_dir="datasets/TacVerse"):
     """Locate a dataset's annotations file on disk, or None.
 
     Resolution order:
       1. `dataset["local_dir"]/meta/lerobot_annotations.json` (pulled records).
-      2. newest (by mtime) `pulls/*/<leaf>/meta/lerobot_annotations.json`.
+      2. `datasets/<org>/<leaf>/meta/lerobot_annotations.json`.
     """
     local_dir = (dataset or {}).get("local_dir")
     if local_dir:
@@ -59,9 +59,11 @@ def resolve_path(dataset, out_dir="pulls"):
     leaf = name.split("/")[-1]
     if not leaf:
         return None
-    candidates = [
-        p for p in Path(out_dir).glob(f"*/{leaf}/{ANNOTATIONS_REL}") if p.is_file()
-    ]
+    direct = Path(out_dir) / leaf / ANNOTATIONS_REL
+    if direct.is_file():
+        return direct
+    candidates = [p for p in Path(out_dir).glob(f"*/{leaf}/{ANNOTATIONS_REL}")
+                  if p.is_file()]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)

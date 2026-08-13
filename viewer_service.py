@@ -23,7 +23,7 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-VIEWER_DIR = Path(__file__).resolve().parent / "vendor" / "lerobot_viewer"
+VIEWER_DIR = Path(__file__).resolve().parent / "third_party" / "lerobot_viewer"
 DEFAULT_PORT = 3000
 
 
