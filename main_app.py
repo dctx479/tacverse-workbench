@@ -49,7 +49,9 @@ _configure_qt_plugin_path()
 
 import pyqtgraph as pg
 from PySide6.QtCore import QDate, Qt, QPoint, QRect, QSize, QThread, QTimer, Signal, QUrl
-from PySide6.QtGui import QBrush, QColor, QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import (
+    QBrush, QColor, QDesktopServices, QFontDatabase, QIcon, QPalette, QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget,
@@ -1069,6 +1071,10 @@ class MainWindow(QWidget):
             avail = screen.availableGeometry()
             target_w = min(target_w, int(avail.width() * 0.90))
             target_h = min(target_h, int(avail.height() * 0.88))
+        screen_width = screen.availableGeometry().width() if screen else target_w
+        # Windows scaling reduces the logical screen width. Keep the dataset
+        # name useful without letting its fixed width squeeze every detail field.
+        self.dataset_column_width = max(280, min(440, int(screen_width * 0.23)))
         self.setWindowState(Qt.WindowNoState)
         self.resize(target_w, target_h)
         if screen:
@@ -1307,7 +1313,7 @@ class MainWindow(QWidget):
         row2.addWidget(self.btn_account)
         self.identity_label = QLabel("登录状态: 检测中…")
         self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.identity_label.setStyleSheet("color:#888;")
+        self.identity_label.setStyleSheet(f"color:{UI_COLORS['text_muted']};")
         self.identity_label.setMinimumWidth(245)
         row2.addWidget(self.identity_label)
 
@@ -1315,6 +1321,7 @@ class MainWindow(QWidget):
         section_label("Viewer", row2)
         self.top_viewer_dot = QLabel("● Viewer")
         self.top_viewer_dot.setToolTip("Viewer 服务状态")
+        self.top_viewer_dot.setFixedWidth(92)
         row2.addWidget(self.top_viewer_dot)
         self.top_viewer_start = QPushButton("启动")
         self.top_viewer_stop = QPushButton("停止")
@@ -1343,7 +1350,8 @@ class MainWindow(QWidget):
 
         row2.addStretch(1)
         self.clock_label = QLabel("")
-        self.clock_label.setStyleSheet("color:#444; font-weight:bold;")
+        self.clock_label.setStyleSheet(
+            f"color:{UI_COLORS['text']}; font-weight:bold;")
         self.clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row2.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
