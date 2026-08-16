@@ -498,6 +498,28 @@ class PullDatasetRetryTests(unittest.TestCase):
         self.assertTrue(any("单线程续传" in line for line in logs))
         summary.assert_called_once_with(self.repo_id, str(self.local_dir))
 
+    @patch.object(dd, "build_summary", return_value={"ok": True})
+    @patch.object(dd.time, "sleep")
+    def test_retries_incomplete_chunked_read(self, _sleep, summary):
+        error = RuntimeError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)")
+        with patch.object(
+                dd, "_snapshot_to_local",
+                side_effect=[error, str(self.local_dir)]) as download:
+            logs = []
+            result = dd.pull_dataset(
+                self.repo_id, self.dataset_dir, None, "token", log=logs.append)
+
+        self.assertEqual({"ok": True}, result)
+        self.assertEqual(
+            [call(self.repo_id, None, self.local_dir, "token", max_workers=8),
+             call(self.repo_id, None, self.local_dir, "token", max_workers=1)],
+            download.call_args_list,
+        )
+        self.assertTrue(any("网络读取中断" in line for line in logs))
+        summary.assert_called_once_with(self.repo_id, str(self.local_dir))
+
     @patch.object(dd, "build_summary")
     def test_does_not_retry_unrelated_download_error(self, summary):
         error = PermissionError("denied")

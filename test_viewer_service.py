@@ -52,6 +52,21 @@ class ViewerDoctorTests(unittest.TestCase):
         self.assertIsNone(result)
         self.assertEqual(error, "failed")
 
+    def test_doctor_retries_incomplete_chunked_read(self):
+        events = [{"type": "result", "result": {"ok": True}}]
+        error = RuntimeError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)")
+        with patch("viewer_service.urllib.request.urlopen",
+                   side_effect=[error, _Response(
+                       [json.dumps(event) + "\n" for event in events])]) as open_url, \
+                patch("viewer_service.time.sleep"):
+            result, err = vsvc.ViewerService(port=3001).doctor("TacVerse/example")
+
+        self.assertIsNone(err)
+        self.assertEqual({"ok": True}, result)
+        self.assertEqual(2, open_url.call_count)
+
 
 class ViewerServiceTests(unittest.TestCase):
     def setUp(self):
@@ -144,6 +159,24 @@ class ViewerServiceTests(unittest.TestCase):
         response.__enter__.return_value = response
         with patch.object(vsvc.urllib.request, "urlopen", return_value=response):
             self.assertIsNone(self.service.service_info(max_age=0))
+
+    def test_report_retries_incomplete_chunked_read(self):
+        response = MagicMock()
+        response.read.return_value = json.dumps({"ok": True}).encode()
+        response.__enter__.return_value = response
+        error = RuntimeError(
+            "peer closed connection without sending complete message body "
+            "(incomplete chunked read)")
+
+        with patch.object(
+                vsvc.urllib.request, "urlopen",
+                side_effect=[error, response]) as open_url, \
+                patch.object(vsvc.time, "sleep"):
+            report, err = self.service.report("TacVerse/example")
+
+        self.assertIsNone(err)
+        self.assertEqual({"ok": True}, report)
+        self.assertEqual(2, open_url.call_count)
 
 
 if __name__ == "__main__":

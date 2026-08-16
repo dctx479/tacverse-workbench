@@ -15,6 +15,7 @@ declared in INFO_FIELDS, so extending the report is a one-line change.
 
 import argparse
 import datetime as dt
+import http.client
 import json
 import os
 import sys
@@ -46,6 +47,74 @@ DEFAULT_FPS = 30
 # Serialize Workbench snapshot calls so a single pull and a batch pull cannot
 # target the same local dataset directory at the same time.
 _SNAPSHOT_LOCK = threading.RLock()
+
+
+_TRANSIENT_NETWORK_MARKERS = (
+    "incomplete chunked read",
+    "peer closed connection without sending complete message body",
+    "incomplete read",
+    "response ended prematurely",
+    "remote end closed connection without response",
+    "connection reset by peer",
+    "connection aborted",
+)
+
+
+def _related_exceptions(exc):
+    """Yield an exception plus common wrapped causes/reasons."""
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for attr in ("__cause__", "__context__", "reason"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException):
+                stack.append(nested)
+        for arg in getattr(current, "args", ()) or ():
+            if isinstance(arg, BaseException):
+                stack.append(arg)
+
+
+def _is_transient_network_error(exc):
+    """Detect short-lived HTTP body/read interruptions worth retrying."""
+    transient_classes = {
+        "ChunkedEncodingError",
+        "ContentTooShortError",
+        "IncompleteRead",
+        "ProtocolError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "RemoteDisconnected",
+    }
+    for current in _related_exceptions(exc):
+        if isinstance(current, (ConnectionError, TimeoutError,
+                               http.client.IncompleteRead,
+                               http.client.RemoteDisconnected)):
+            return True
+        if current.__class__.__name__ in transient_classes:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _TRANSIENT_NETWORK_MARKERS):
+            return True
+    return False
+
+
+def _retry_transient(call, *, label="", log=None, attempts=3, delay=0.6):
+    """Retry idempotent Hub reads when the peer drops a chunked response."""
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt >= attempts or not _is_transient_network_error(exc):
+                raise
+            if log:
+                prefix = f"{label}: " if label else ""
+                log(f"{prefix}网络读取中断，正在重试 {attempt}/{attempts - 1} ...")
+            time.sleep(delay * attempt)
 
 
 def normalize_proxy_env() -> None:
@@ -117,11 +186,14 @@ def fetch_tasks(repo_id: str, token=None) -> list:
     from huggingface_hub import hf_hub_download
 
     try:
-        path = hf_hub_download(
-            repo_id=repo_id,
-            filename="meta/tasks.parquet",
-            repo_type="dataset",
-            token=token,
+        path = _retry_transient(
+            lambda: hf_hub_download(
+                repo_id=repo_id,
+                filename="meta/tasks.parquet",
+                repo_type="dataset",
+                token=token,
+            ),
+            label=f"读取 {repo_id} tasks",
         )
     except Exception:
         return []  # dataset has no tasks.parquet (or no access)
@@ -145,11 +217,14 @@ def fetch_summary(repo_id: str, token=None) -> dict:
         "link": HF_DATASET_URL.format(repo_id=repo_id),
     }
     try:
-        info_path = hf_hub_download(
-            repo_id=repo_id,
-            filename="meta/info.json",
-            repo_type="dataset",
-            token=token,
+        info_path = _retry_transient(
+            lambda: hf_hub_download(
+                repo_id=repo_id,
+                filename="meta/info.json",
+                repo_type="dataset",
+                token=token,
+            ),
+            label=f"读取 {repo_id} info",
         )
     except Exception:
         return summary  # no info.json -> name+link only
@@ -170,7 +245,10 @@ def discover_datasets_meta(org, token):
     # huggingface_hub versions (e.g. 1.23.x) do not expose a `direction` kwarg,
     # so we sort client-side as the source of truth and also pin timestamp-less
     # repos last.
-    ds = list(list_datasets(author=org, token=token, sort="lastModified"))
+    ds = _retry_transient(
+        lambda: list(list_datasets(author=org, token=token, sort="lastModified")),
+        label=f"发现 {org} 数据集",
+    )
     ds.sort(key=lambda d: (d.last_modified is not None, d.last_modified), reverse=True)
     out = []
     for d in ds:
@@ -194,7 +272,11 @@ def fetch_uploader(repo_id, token=None):
     from huggingface_hub import HfApi
 
     try:
-        commits = HfApi().list_repo_commits(repo_id, repo_type="dataset", token=token)
+        commits = _retry_transient(
+            lambda: HfApi().list_repo_commits(
+                repo_id, repo_type="dataset", token=token),
+            label=f"读取 {repo_id} commits",
+        )
     except Exception:
         return {}
     if not commits:
@@ -251,15 +333,14 @@ def pull_dataset(repo_id, dataset_dir, revision, token, log=print):
     """Download one dataset into <dataset_dir>/<dataset-name> and summarize it."""
     local_dir = Path(dataset_dir) / repo_id.split("/")[-1]
     log(f"Downloading {repo_id} -> {local_dir}")
-    attempts = [
-        (8, None),
-        (1, "检测到缓存临时文件异常，正在单线程续传…"),
-    ]
+    attempts = [8, 1, 1]
+    retry_note = None
     with _SNAPSHOT_LOCK:
-        for index, (workers, retry_message) in enumerate(attempts):
-            if retry_message:
-                log(retry_message)
+        for index, workers in enumerate(attempts):
+            if retry_note:
+                log(retry_note)
                 time.sleep(0.25)
+                retry_note = None
             try:
                 _snapshot_to_local(
                     repo_id, revision, local_dir, token,
@@ -267,8 +348,11 @@ def pull_dataset(repo_id, dataset_dir, revision, token, log=print):
                 )
                 break
             except Exception as exc:
-                if not _is_local_cache_temp_error(exc) or \
-                        index == len(attempts) - 1:
+                if _is_local_cache_temp_error(exc):
+                    retry_note = "检测到缓存临时文件异常，正在单线程续传…"
+                elif _is_transient_network_error(exc):
+                    retry_note = "网络读取中断，正在续传…"
+                if not retry_note or index == len(attempts) - 1:
                     raise
     return build_summary(repo_id, str(local_dir))
 
@@ -1248,12 +1332,15 @@ def _summary_from_info(repo_id, info):
 def _fetch_info_at_revision(repo_id, revision, token=None):
     from huggingface_hub import hf_hub_download
 
-    path = hf_hub_download(
-        repo_id=repo_id,
-        filename="meta/info.json",
-        repo_type="dataset",
-        revision=revision,
-        token=token,
+    path = _retry_transient(
+        lambda: hf_hub_download(
+            repo_id=repo_id,
+            filename="meta/info.json",
+            repo_type="dataset",
+            revision=revision,
+            token=token,
+        ),
+        label=f"读取 {repo_id}@{revision} info",
     )
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -1274,9 +1361,16 @@ def build_hf_change_rows(repo_id, dataset, token=None):
 
     api = HfApi()
     try:
-        commits = api.list_repo_commits(repo_id=repo_id, repo_type="dataset", token=token)
+        commits = _retry_transient(
+            lambda: api.list_repo_commits(
+                repo_id=repo_id, repo_type="dataset", token=token),
+            label=f"读取 {repo_id} commits",
+        )
     except TypeError:
-        commits = api.list_repo_commits(repo_id=repo_id, repo_type="dataset")
+        commits = _retry_transient(
+            lambda: api.list_repo_commits(repo_id=repo_id, repo_type="dataset"),
+            label=f"读取 {repo_id} commits",
+        )
     commits = sorted(commits, key=lambda commit: _commit_created_at(commit) or "")
     prev = None
     rows = []

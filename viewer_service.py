@@ -12,6 +12,7 @@ builds deep-link URLs. It is Qt-free so it can be unit-tested and reused.
 """
 
 import base64
+import http.client
 import json
 import os
 import shutil
@@ -63,6 +64,68 @@ def _http_ok(url, timeout=1.0):
             return 200 <= resp.status < 500
     except Exception:
         return False
+
+
+_TRANSIENT_HTTP_MARKERS = (
+    "incomplete chunked read",
+    "peer closed connection without sending complete message body",
+    "incomplete read",
+    "response ended prematurely",
+    "remote end closed connection without response",
+    "connection reset by peer",
+    "connection aborted",
+)
+
+
+def _related_exceptions(exc):
+    seen = set()
+    stack = [exc]
+    while stack:
+        current = stack.pop()
+        if current is None or id(current) in seen:
+            continue
+        seen.add(id(current))
+        yield current
+        for attr in ("__cause__", "__context__", "reason"):
+            nested = getattr(current, attr, None)
+            if isinstance(nested, BaseException):
+                stack.append(nested)
+        for arg in getattr(current, "args", ()) or ():
+            if isinstance(arg, BaseException):
+                stack.append(arg)
+
+
+def _is_transient_http_error(exc):
+    transient_classes = {
+        "ChunkedEncodingError",
+        "ContentTooShortError",
+        "IncompleteRead",
+        "ProtocolError",
+        "ReadTimeout",
+        "ReadTimeoutError",
+        "RemoteDisconnected",
+    }
+    for current in _related_exceptions(exc):
+        if isinstance(current, (ConnectionError, TimeoutError,
+                               http.client.IncompleteRead,
+                               http.client.RemoteDisconnected)):
+            return True
+        if current.__class__.__name__ in transient_classes:
+            return True
+        text = str(current).lower()
+        if any(marker in text for marker in _TRANSIENT_HTTP_MARKERS):
+            return True
+    return False
+
+
+def _retry_transient_http(call, *, attempts=3, delay=0.4):
+    for attempt in range(1, attempts + 1):
+        try:
+            return call()
+        except Exception as exc:
+            if attempt >= attempts or not _is_transient_http_error(exc):
+                raise
+            time.sleep(delay * attempt)
 
 
 def _same_path(left, right):
@@ -278,9 +341,11 @@ class ViewerService:
         if self._info_cache is not None and now - self._info_cache_at <= max_age:
             return self._info_cache
         try:
-            with urllib.request.urlopen(
-                    self.base_url + "/api/local-datasets", timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            def read_info():
+                with urllib.request.urlopen(
+                        self.base_url + "/api/local-datasets", timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            data = _retry_transient_http(read_info)
             if not isinstance(data, dict) or not isinstance(data.get("root"), str):
                 return None
             if not isinstance(data.get("datasets"), list):
@@ -544,8 +609,10 @@ class ViewerService:
         if include:
             url += "?include=" + ",".join(include)
         try:
-            with urllib.request.urlopen(url, timeout=timeout) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
+            def read_report():
+                with urllib.request.urlopen(url, timeout=timeout) as resp:
+                    return json.loads(resp.read().decode("utf-8"))
+            data = _retry_transient_http(read_report)
         except Exception as exc:
             return None, str(exc)
         if isinstance(data, dict) and data.get("ok") is False:
@@ -569,30 +636,17 @@ class ViewerService:
         }
         if checks is not None:
             payload["checks"] = checks
-        request = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
-                result = None
-                for raw_line in resp:
-                    if not raw_line.strip():
-                        continue
-                    event = json.loads(raw_line.decode("utf-8"))
-                    kind = event.get("type") if isinstance(event, dict) else None
-                    if kind == "progress":
-                        if on_progress:
-                            on_progress(event.get("progress") or {})
-                    elif kind == "result":
-                        result = event.get("result")
-                    elif kind == "error":
-                        return None, str(event.get("error") or "Doctor failed")
-                if result is None:
-                    return None, "Doctor stream ended without a result"
-                return result, None
+            def read_doctor():
+                request = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(request, timeout=timeout) as resp:
+                    return self._read_doctor_stream(resp, on_progress)
+            return _retry_transient_http(read_doctor)
         except urllib.error.HTTPError as exc:
             try:
                 body = json.loads(exc.read().decode("utf-8"))
@@ -602,6 +656,25 @@ class ViewerService:
             return None, str(message or f"HTTP {exc.code}")
         except Exception as exc:
             return None, str(exc)
+
+    @staticmethod
+    def _read_doctor_stream(resp, on_progress=None):
+        result = None
+        for raw_line in resp:
+            if not raw_line.strip():
+                continue
+            event = json.loads(raw_line.decode("utf-8"))
+            kind = event.get("type") if isinstance(event, dict) else None
+            if kind == "progress":
+                if on_progress:
+                    on_progress(event.get("progress") or {})
+            elif kind == "result":
+                result = event.get("result")
+            elif kind == "error":
+                return None, str(event.get("error") or "Doctor failed")
+        if result is None:
+            return None, "Doctor stream ended without a result"
+        return result, None
 
     def status(self):
         port_in_use = _port_in_use(self.port)
