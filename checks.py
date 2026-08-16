@@ -47,9 +47,9 @@ DEFAULTS = {
         "start_end_window": 10,
         "boundary_mad_factor": 6.0,
         "boundary_abs_threshold": 0.20,
-        "jump_mad_factor": 8.0,
-        "jump_abs_threshold": 0.15,
-        "flicker_sample_step": 1,
+        "jump_mad_factor": 14.0,
+        "jump_abs_threshold": 0.35,
+        "flicker_sample_step": 3,
         "flicker_luma_threshold": 45.0,
         "flicker_recover_ratio": 0.45,
         "max_video_frames": 12000,
@@ -178,7 +178,8 @@ def _check_local_quality(dataset, cfg):
     import dataset_quality
 
     issues = dataset_quality.scan_dataset(
-        dataset, out_dir="pulls", cfg=_cfg(cfg, "local_quality"))
+        dataset, out_dir="datasets/TacVerse",
+        cfg=_cfg(cfg, "local_quality"))
     return format_local_quality_issues(issues)
 
 

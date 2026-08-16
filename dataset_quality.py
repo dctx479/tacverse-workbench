@@ -18,6 +18,7 @@ from functools import lru_cache
 import csv
 import html
 import math
+import os
 import re
 import shutil
 import json
@@ -109,7 +110,7 @@ def _cfg(cfg):
     return merged
 
 
-def dataset_dir(dataset, out_dir="pulls"):
+def dataset_dir(dataset, out_dir="datasets/TacVerse"):
     local_dir = (dataset or {}).get("local_dir")
     if local_dir and (Path(local_dir) / "meta" / "info.json").is_file():
         return Path(local_dir)
@@ -117,11 +118,16 @@ def dataset_dir(dataset, out_dir="pulls"):
     leaf = ((dataset or {}).get("dataset_name") or "").split("/")[-1]
     if not leaf:
         return None
-    candidates = [
+    base = Path(out_dir)
+    candidates = []
+    flat = base / leaf
+    if (flat / "meta" / "info.json").is_file():
+        candidates.append(flat)
+    candidates.extend(
         p.parent.parent
-        for p in Path(out_dir).glob(f"*/{leaf}/meta/info.json")
+        for p in base.glob(f"*/{leaf}/meta/info.json")
         if p.is_file()
-    ]
+    )
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)
@@ -129,6 +135,16 @@ def dataset_dir(dataset, out_dir="pulls"):
 
 def _repo_leaf(repo_id):
     return _safe_name((repo_id or "").split("/")[-1])
+
+
+def _hub_local_dir(local_dir):
+    """Return an extended Win32 path for Hub cache files over MAX_PATH."""
+    path = str(Path(local_dir).resolve())
+    if os.name != "nt" or path.startswith("\\\\?\\"):
+        return path
+    if path.startswith("\\\\"):
+        return "\\\\?\\UNC\\" + path.lstrip("\\")
+    return "\\\\?\\" + path
 
 
 def _episode_key(path):
@@ -182,7 +198,7 @@ def remote_dataset_dir(dataset, cfg):
             repo_id=repo_id,
             repo_type="dataset",
             token=token,
-            local_dir=str(local_dir),
+            local_dir=_hub_local_dir(local_dir),
             allow_patterns=allow_patterns,
         )
     except Exception as exc:
@@ -1103,7 +1119,7 @@ def scan_path(root_str, cfg_items):
     return _scan_path_uncached(root, cfg)
 
 
-def scan_dataset(dataset, out_dir="pulls", cfg=None, progress=None, cancel=None):
+def scan_dataset(dataset, out_dir="datasets/TacVerse", cfg=None, progress=None, cancel=None):
     root = dataset_dir(dataset, out_dir)
     merged = _cfg(cfg)
     if (dataset or {}).get("fps"):
@@ -1462,7 +1478,7 @@ def save_quality_status(data, path="quality_status.local.json"):
     Path(path).write_text(json.dumps(data or {}, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
 
 
-def scan_dataset_with_report(dataset, out_dir="pulls", cfg=None, progress=None, cancel=None):
+def scan_dataset_with_report(dataset, out_dir="datasets/TacVerse", cfg=None, progress=None, cancel=None):
     issues = scan_dataset(dataset, out_dir=out_dir, cfg=cfg, progress=progress, cancel=cancel)
     _check_cancel(cancel)
     _emit(progress, "写入 Markdown/HTML/CSV/JSON 报告...", 97)
