@@ -732,57 +732,6 @@ class CheckWorker(QThread):
             self.error.emit(str(exc))
 
 
-class QualityWorker(QThread):
-    """Run local/remote deep episode quality checks off the GUI thread."""
-
-    done = Signal(int, str, list, dict, str)  # seq, dataset_name, results, aggregate, report_dir
-    progress = Signal(str, int)
-
-    def __init__(self, seq, dataset, token, cfg):
-        super().__init__()
-        self.seq = seq
-        self.dataset = dict(dataset or {})
-        self.dataset_name = self.dataset.get("dataset_name") or ""
-        self.token = token
-        self.cfg = dict(cfg or {})
-        self.cancel_requested = False
-
-    def cancel(self):
-        self.cancel_requested = True
-
-    def run(self):
-        checks_cfg = dict(self.cfg)
-        local_quality_cfg = dict(checks_cfg.get("local_quality") or {})
-        local_quality_cfg["token"] = self.token
-        checks_cfg["local_quality"] = local_quality_cfg
-        try:
-            import dataset_quality
-            self.progress.emit("准备深度检查...", 0)
-            if self.cancel_requested:
-                raise RuntimeError("检查已取消")
-            self.progress.emit("读取本地/远程数据并定位问题...", 5)
-            issues, report_dir = dataset_quality.scan_dataset_with_report(
-                self.dataset, out_dir=OUT_DIR, cfg=local_quality_cfg,
-                progress=lambda text, pct=None: self.progress.emit(text, int(pct or 0)),
-                cancel=lambda: self.cancel_requested)
-            if self.cancel_requested:
-                raise RuntimeError("检查已取消")
-            self.progress.emit("生成检查报告和视频切片...", 98)
-            status, message, details = chk_mod.format_local_quality_issues(issues)
-            results = [chk_mod.CheckResult(
-                "episode_local_quality", "Episode 级质量定位",
-                "local_quality", status, message, details)]
-            agg = chk_mod.aggregate(results)
-        except Exception as exc:
-            report_dir = ""
-            msg = "检查已取消" if self.cancel_requested else f"检查出错: {exc}"
-            results = [chk_mod.CheckResult(
-                "episode_local_quality", "Episode 级质量定位",
-                "local_quality", chk_mod.SKIP, msg, [])]
-            agg = chk_mod.aggregate(results)
-        self.done.emit(self.seq, self.dataset_name, results, agg, report_dir)
-
-
 class IdentityWorker(QThread):
     """Resolve who the current token logs in as and how many org datasets it can
     see — so the status bar can flag token/permission problems at a glance."""
@@ -976,10 +925,16 @@ class LerobotOpWorker(QThread):
     def __init__(self, spec):
         super().__init__()
         self.spec = spec
+        self.cancel_requested = False
+
+    def cancel(self):
+        self.cancel_requested = True
 
     def run(self):
         try:
-            result = lops.run_op(self.spec, log=self.log.emit)
+            result = lops.run_op(
+                self.spec, log=self.log.emit,
+                cancel=lambda: self.cancel_requested)
             if result.get("ok"):
                 self.done.emit(result)
             else:
@@ -3435,6 +3390,7 @@ class MainWindow(QWidget):
         self.quality_worker = QualityWorker(seq, dataset, self.token, _CHECKS_CFG)
         self.quality_worker.progress.connect(self._on_quality_progress)
         self.quality_worker.done.connect(self._on_quality_done)
+        self.quality_worker.finished.connect(self._on_quality_worker_finished)
         self.quality_worker.start()
 
     def on_quality_cancel(self):
@@ -3454,9 +3410,6 @@ class MainWindow(QWidget):
         if index >= 0:
             self.check_tree.takeTopLevelItem(index)
         self._quality_group = self._add_quality_check_group(results)
-        self.btn_quality_check.setEnabled(True)
-        self.btn_quality_cancel.setEnabled(False)
-        self.quality_progress.setVisible(False)
         if report_dir and Path(report_dir).is_dir():
             self._quality_status[name] = "已检查"
             self._quality_reports[name] = report_dir
@@ -3472,6 +3425,16 @@ class MainWindow(QWidget):
         selected = self._selected_dataset() or {}
         if selected.get("dataset_name") == name:
             self._refresh_quality_report_panel(selected)
+
+    def _on_quality_worker_finished(self):
+        worker = self.sender()
+        if worker is self.quality_worker:
+            self.quality_worker = None
+        self.btn_quality_check.setEnabled(True)
+        self.btn_quality_cancel.setEnabled(False)
+        self.quality_progress.setVisible(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _current_quality_report(self):
         dataset = self._selected_dataset() or {}
@@ -4444,6 +4407,8 @@ class MainWindow(QWidget):
                      "_edit_worker", "_push_worker", "_op_worker"):
             w = getattr(self, name, None)
             if w is not None and hasattr(w, "wait") and w.isRunning():
+                if hasattr(w, "cancel"):
+                    w.cancel()
                 if not w.wait(5000):
                     w.terminate()
                     w.wait(2000)
