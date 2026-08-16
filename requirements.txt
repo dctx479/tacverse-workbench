@@ -1,0 +1,9 @@
+huggingface_hub
+PySide6
+pyqtgraph
+pyarrow
+psutil
+numpy
+opencv-python
+imageio-ffmpeg
+matplotlib

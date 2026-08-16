@@ -56,7 +56,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QCheckBox, QComboBox, QFrame, QGridLayout,
     QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLayout, QLineEdit, QListWidget,
     QListWidgetItem, QMessageBox, QFileDialog, QProgressBar, QPushButton, QScrollArea,
-    QSpinBox, QStackedWidget,
+    QDateEdit, QSizePolicy, QSpinBox, QStackedWidget,
     QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTreeWidget,
     QTreeWidgetItem, QVBoxLayout, QWidget,
 )
@@ -105,12 +105,12 @@ UI_COLORS = {
 MUTED_TEXT_STYLE = f"color:{UI_COLORS['text_muted']}; font-size:9pt;"
 BLUE_PANEL_STYLE = (
     "QGroupBox{font-weight:bold; border:1px solid #9EC5FE;"
-    " border-radius:6px; margin-top:10px; background:#F6F9FF;}"
+    " border-radius:6px; margin-top:7px; padding-top:2px; background:#F6F9FF;}"
     "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#175CD3;}"
 )
 GREEN_PANEL_STYLE = (
     "QGroupBox{font-weight:bold; border:1px solid #A3D9A5;"
-    " border-radius:6px; margin-top:10px; background:#F4FAF4;}"
+    " border-radius:6px; margin-top:7px; padding-top:2px; background:#F4FAF4;}"
     "QGroupBox::title{subcontrol-origin:margin; left:10px; color:#237A36;}"
 )
 
@@ -164,7 +164,7 @@ def configure_application_ui(app):
             padding: 4px 6px;
         }}
         QPushButton {{
-            min-height: 28px; padding: 3px 10px;
+            min-height: 26px; padding: 2px 9px;
             background: {UI_COLORS['surface']};
             border: 1px solid {UI_COLORS['border_strong']}; border-radius: 5px;
         }}
@@ -175,7 +175,7 @@ def configure_application_ui(app):
             border-color: {UI_COLORS['border']};
         }}
         QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QDateEdit {{
-            min-height: 28px; padding: 2px 7px;
+            min-height: 26px; padding: 1px 7px;
             color: {UI_COLORS['text']}; background: {UI_COLORS['surface']};
             border: 1px solid {UI_COLORS['border_strong']}; border-radius: 4px;
             selection-background-color: {UI_COLORS['blue']};
@@ -194,7 +194,7 @@ def configure_application_ui(app):
             border: 1px solid {UI_COLORS['border']}; border-radius: 4px;
         }}
         QTabBar::tab {{
-            min-height: 30px; padding: 4px 14px;
+            min-height: 28px; padding: 3px 13px;
             color: {UI_COLORS['text_muted']}; background: #EAECF0;
             border: 1px solid {UI_COLORS['border']};
             border-bottom: none; border-top-left-radius: 4px;
@@ -211,14 +211,14 @@ def configure_application_ui(app):
             selection-background-color: #D9E8FF; selection-color: #102A56;
         }}
         QHeaderView::section {{
-            min-height: 28px; padding: 3px 7px;
+            min-height: 26px; padding: 2px 7px;
             color: #344054; background: #EAECF0;
             border: none; border-right: 1px solid {UI_COLORS['border']};
             border-bottom: 1px solid {UI_COLORS['border']}; font-weight: bold;
         }}
         QGroupBox {{
             border: 1px solid {UI_COLORS['border']}; border-radius: 5px;
-            margin-top: 10px; padding-top: 4px;
+            margin-top: 7px; padding-top: 2px;
         }}
         QGroupBox::title {{ subcontrol-origin: margin; left: 9px; padding: 0 4px; }}
         QScrollArea {{ border: none; background: transparent; }}
@@ -325,6 +325,8 @@ TABLE_COLS = [
 # stays correct if columns are inserted/reordered above.
 DATE_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "last_modified")
 LOCAL_COL = next(i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "__local__")
+QUALITY_STATUS_COL = next(
+    i for i, (_, k, _) in enumerate(TABLE_COLS) if k == "__quality_status__")
 
 # Order = dropdown order; first entry (上传者) is the default. robot_type last.
 ROLLUP_DIMS = {
@@ -432,6 +434,7 @@ class NumericItem(QTableWidgetItem):
 class FrozenDatasetTable(QWidget):
     """Two synchronized tables: fixed dataset column + scrollable detail columns."""
 
+    cellClicked = Signal(int, int)
     cellDoubleClicked = Signal(int, int)
     itemSelectionChanged = Signal()
 
@@ -470,8 +473,10 @@ class FrozenDatasetTable(QWidget):
             self.detail.verticalScrollBar().setValue)
         self.detail.verticalScrollBar().valueChanged.connect(
             self.fixed.verticalScrollBar().setValue)
-        self.fixed.cellClicked.connect(lambda row, _col: self.selectRow(row))
-        self.detail.cellClicked.connect(lambda row, _col: self.selectRow(row))
+        self.fixed.cellClicked.connect(
+            lambda row, _col: self._handle_cell_clicked(row, 0))
+        self.detail.cellClicked.connect(
+            lambda row, col: self._handle_cell_clicked(row, col + 1))
         self.fixed.cellDoubleClicked.connect(
             lambda row, col: self.cellDoubleClicked.emit(row, col))
         self.detail.cellDoubleClicked.connect(
@@ -552,6 +557,10 @@ class FrozenDatasetTable(QWidget):
         self.fixed.blockSignals(False)
         self.detail.blockSignals(False)
         self.itemSelectionChanged.emit()
+
+    def _handle_cell_clicked(self, row, column):
+        self.selectRow(row)
+        self.cellClicked.emit(row, column)
 
     def _sync_selection(self, source):
         row = source.currentRow()
@@ -1083,7 +1092,14 @@ class MainWindow(QWidget):
             self.move(frame.topLeft())
         self.token = resolve_token()
         self.worker = None
+        self._pull_worker = None
+        self._check_worker = None
+        self.dl_worker = None
+        self._download_done_path = ""
+        self._download_message_box = None
         self._stats_worker = None
+        self._closing = False
+        self._shutdown_done = False
         self.report = None
         self.history = []
         self._id_workers = []  # in-flight IdentityWorkers (kept alive until done)
@@ -1102,11 +1118,16 @@ class MainWindow(QWidget):
         self._doctor_seq = 0
         self._doctor_cache = {}     # (rel_path, scope) -> Doctor response
         self._quality_records = self._load_quality_records()
+        self._quality_status = {
+            name: record.get("status", "未检查")
+            for name, record in self._quality_records.items()
+        }
         self._quality_reports = {
             name: record.get("report_dir", "")
             for name, record in self._quality_records.items()
         }
         self._quality_seq = 0
+        self._rollup_range_initialized = False
         self.quality_worker = None
         # 数据集编辑 state: the dataset being edited, its prompt editors, and the
         # last copy written (so 推送到 Hub knows what to upload). Workers held on
@@ -1137,6 +1158,9 @@ class MainWindow(QWidget):
         self.quality_status_timer.setInterval(3000)
         self.quality_status_timer.timeout.connect(self._sync_quality_status_from_disk)
         self.quality_status_timer.start()
+        app = QApplication.instance()
+        if app is not None:
+            app.aboutToQuit.connect(self._prepare_shutdown)
 
         # 看板/表格 default to the LAST pull's results (from committed history) so
         # they aren't blank on open; a stale banner flags that it's not live, and
@@ -1155,7 +1179,8 @@ class MainWindow(QWidget):
             self._refresh_all()
             self._show_stale_banner(last)
         else:
-            self._refresh_trends()
+            self._set_rollup_range_defaults()
+            self._refresh_rollup()
         self.status.setText(
             "就绪：「仅拉取统计信息」(快) / 「下载当前选中数据集」/ "
             f"「拉取组织及其下所有数据集」{migration_note}。")
@@ -1206,8 +1231,8 @@ class MainWindow(QWidget):
     # ---- UI construction -------------------------------------------------- #
     def _build_ui(self):
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 7, 8, 6)
+        root.setSpacing(5)
 
         # The toolbar is intentionally split into two functional rows.  The
         # first row contains data acquisition/maintenance actions; the second
@@ -1215,11 +1240,11 @@ class MainWindow(QWidget):
         # widgets out of the action row prevents long identity text and the
         # clock from forcing the primary buttons into an unclear wrap order.
         toolbar = QVBoxLayout()
-        toolbar.setSpacing(3)
+        toolbar.setSpacing(1)
         row1 = QHBoxLayout()
-        row1.setSpacing(6)
+        row1.setSpacing(5)
         row2 = QHBoxLayout()
-        row2.setSpacing(6)
+        row2.setSpacing(5)
 
         def separator(layout):
             line = QFrame()
@@ -1292,7 +1317,7 @@ class MainWindow(QWidget):
             "QPushButton:hover { background: #ECECEC; }"
         )
         for b in (self.btn_stats, self.btn_download, self.btn_pull):
-            b.setMinimumHeight(34)
+            b.setMinimumHeight(30)
             b.setStyleSheet(primary_css % (
                 "#34A853" if b is self.btn_stats else
                 "#F59E0B" if b is self.btn_download else "#4C8BF5",
@@ -1364,7 +1389,6 @@ class MainWindow(QWidget):
 
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_dashboard_tab(), "看板")
-        self.tabs.addTab(self._build_trends_tab(), "趋势")
         self.tabs.addTab(self._build_rollup_tab(), "分组统计")
         self.tabs.addTab(self._build_edit_tab(), "数据集编辑")
         self.tabs.addTab(self._build_viewer_tab(), "Viewer")
@@ -1402,13 +1426,16 @@ class MainWindow(QWidget):
         """看板 = 左「数据集统计分区」(总览 + 详情表) | 右「数据集检查分区」(分析网格)."""
         w = QWidget()
         outer = QHBoxLayout(w)
-        outer.setContentsMargins(4, 4, 4, 4)
+        outer.setContentsMargins(3, 3, 3, 3)
+        outer.setSpacing(4)
         split = QSplitter(Qt.Horizontal)
 
         # ===== LEFT: 数据集统计分区 =====
         left = QGroupBox("数据集统计分区")
         left.setStyleSheet(BLUE_PANEL_STYLE)
         lv = QVBoxLayout(left)
+        lv.setContentsMargins(8, 8, 8, 6)
+        lv.setSpacing(5)
 
         # Stale-data banner: on open we default to showing the LAST pull's results
         # (so the 看板/表格 aren't blank), clearly flagged as not live. Hidden once
@@ -1418,14 +1445,14 @@ class MainWindow(QWidget):
         self.stale_banner.setVisible(False)
         self.stale_banner.setStyleSheet(
             "background:#fff3cd; color:#8a6d3b; border:1px solid #ffe69c;"
-            " border-radius:6px; padding:6px 10px; font-weight:bold;")
+            " border-radius:6px; padding:5px 9px; font-weight:bold;")
         lv.addWidget(self.stale_banner)
 
         # 数据集总览 (KPI cards, 4 per row)
         self.kpi_labels = {}
         kpi_grid = QGridLayout()
-        kpi_grid.setHorizontalSpacing(8)
-        kpi_grid.setVerticalSpacing(8)
+        kpi_grid.setHorizontalSpacing(6)
+        kpi_grid.setVerticalSpacing(6)
         for column in range(4):
             kpi_grid.setColumnStretch(column, 1)
         for i, (key, title, hl) in enumerate(self.KPI_CARDS):
@@ -1441,6 +1468,7 @@ class MainWindow(QWidget):
 
         # Filter box
         filt = QHBoxLayout()
+        filt.setSpacing(5)
         filt.addWidget(QLabel("筛选:"))
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("按 名称 / robot_type / 上传者 过滤…")
@@ -1478,6 +1506,8 @@ class MainWindow(QWidget):
         right = QGroupBox("数据集检查分区")
         right.setStyleSheet(GREEN_PANEL_STYLE)
         rv = QVBoxLayout(right)
+        rv.setContentsMargins(8, 8, 8, 6)
+        rv.setSpacing(5)
         rv.addWidget(self._build_prompt_panel())
 
         split.addWidget(left)
@@ -1531,7 +1561,8 @@ class MainWindow(QWidget):
         opening the viewer WebUI."""
         panel = QWidget()
         pv = QVBoxLayout(panel)
-        pv.setContentsMargins(8, 0, 0, 0)
+        pv.setContentsMargins(4, 0, 0, 0)
+        pv.setSpacing(5)
 
         self.prompt_meta = QLabel("")
         self.prompt_meta.setStyleSheet(MUTED_TEXT_STYLE)
@@ -1547,6 +1578,7 @@ class MainWindow(QWidget):
         pv.addWidget(self.report_progress)
 
         mode_row = QHBoxLayout()
+        mode_row.setSpacing(5)
         mode_row.addWidget(QLabel("右侧视图:"))
         self.data_check_mode_button = QPushButton("数据检查")
         self.doctor_mode_button = QPushButton("Doctor")
@@ -1753,13 +1785,22 @@ class MainWindow(QWidget):
         self.detail_stack.addWidget(self.detail_grid)
         self.doctor_panel = self._build_doctor_panel()
         self.detail_stack.addWidget(self.doctor_panel)
-        pv.addWidget(self.detail_stack, 1)
+        self.detail_scroll = QScrollArea()
+        self.detail_scroll.setWidgetResizable(True)
+        self.detail_scroll.setFrameShape(QFrame.NoFrame)
+        self.detail_scroll.setMinimumHeight(180)
+        self.detail_scroll.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+        self.detail_scroll.setStyleSheet("QScrollArea{background:transparent;}")
+        self.detail_scroll.viewport().setStyleSheet("background:transparent;")
+        self.detail_scroll.setWidget(self.detail_stack)
+        pv.addWidget(self.detail_scroll, 1)
 
         # --- Fallback: nothing selected -------------------------------------
         self.prompt_empty = QLabel("选择左侧数据集查看信息。")
         self.prompt_empty.setStyleSheet(MUTED_TEXT_STYLE)
         self.prompt_empty.setWordWrap(True)
         self.prompt_empty.setAlignment(Qt.AlignCenter)
+        self.prompt_empty.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         pv.addWidget(self.prompt_empty, 1)
 
         self._prompt_doc = {"episodes": {}, "updated_at": None}
@@ -1866,13 +1907,15 @@ class MainWindow(QWidget):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        card.setMinimumHeight(78)
+        card.setMinimumHeight(66)
         if highlight:
             # 总小时数 — the key metric, visually distinct.
             card.setStyleSheet(
                 "QFrame{background:#E8F5E9; border:1px solid #66BB6A;"
                 " border-radius:6px;}")
         cv = QVBoxLayout(card)
+        cv.setContentsMargins(8, 6, 8, 6)
+        cv.setSpacing(3)
         t = QLabel(title)
         t.setStyleSheet(
             "color:#1B5E20; font-size:9pt; font-weight:bold;" if highlight
@@ -1894,8 +1937,10 @@ class MainWindow(QWidget):
         card = QFrame()
         card.setFrameShape(QFrame.StyledPanel)
         card.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
-        card.setMinimumHeight(78)
+        card.setMinimumHeight(66)
         cv = QVBoxLayout(card)
+        cv.setContentsMargins(8, 6, 8, 6)
+        cv.setSpacing(3)
         t = QLabel("今日 MVP ⭐")
         t.setStyleSheet(f"color:{UI_COLORS['text_muted']}; font-size:9pt;")
         self.mvp_name_lbl = QLabel("—")
@@ -1914,22 +1959,34 @@ class MainWindow(QWidget):
         cv.addWidget(self.mvp_sub_lbl)
         return card
 
-    def _build_trends_tab(self):
-        w = QWidget()
+    def _build_rollup_trends_box(self):
+        w = QGroupBox("区间趋势")
         v = QVBoxLayout(w)
+        v.setContentsMargins(8, 8, 8, 6)
         self.trend_hint = QLabel("")
+        self.trend_hint.setStyleSheet(MUTED_TEXT_STYLE)
+        self.trend_hint.setWordWrap(True)
         v.addWidget(self.trend_hint)
-        self.daily_plot = pg.PlotWidget(title="每日新增小时数")
-        self.daily_plot.showGrid(x=False, y=True, alpha=0.3)
-        v.addWidget(self.daily_plot)
-        self.cum_plot = pg.PlotWidget(title="累计小时数")
-        self.cum_plot.showGrid(x=False, y=True, alpha=0.3)
-        v.addWidget(self.cum_plot)
-        # X labels are two lines ("07-03\n周五"); give the bottom axis enough
-        # height so the weekday line isn't clipped.
-        for pltw in (self.daily_plot, self.cum_plot):
-            pltw.getAxis("bottom").setHeight(46)
+        self.trend_plot = pg.PlotWidget(title="每日新增与累计小时数")
+        self.trend_plot.showGrid(x=False, y=True, alpha=0.3)
+        self.trend_plot.setMinimumHeight(160)
+        self.trend_plot.getAxis("bottom").setHeight(32)
+        self.trend_plot.getAxis("left").setLabel("小时")
+        self.trend_cum_view = pg.ViewBox()
+        self.trend_plot.scene().addItem(self.trend_cum_view)
+        self.trend_plot.getAxis("right").linkToView(self.trend_cum_view)
+        self.trend_cum_view.setXLink(self.trend_plot)
+        self.trend_plot.hideAxis("right")
+        self.trend_plot.getViewBox().sigResized.connect(self._sync_trend_cum_view)
+        v.addWidget(self.trend_plot, 1)
         return w
+
+    def _sync_trend_cum_view(self):
+        if not hasattr(self, "trend_cum_view"):
+            return
+        main_vb = self.trend_plot.getViewBox()
+        self.trend_cum_view.setGeometry(main_vb.sceneBoundingRect())
+        self.trend_cum_view.linkedViewChanged(main_vb, self.trend_cum_view.XAxis)
 
     def _build_rollup_tab(self):
         w = QWidget()
@@ -1940,6 +1997,25 @@ class MainWindow(QWidget):
         self.dim_combo.addItems(list(ROLLUP_DIMS.keys()))
         self.dim_combo.currentTextChanged.connect(self._refresh_rollup)
         row.addWidget(self.dim_combo)
+        row.addSpacing(12)
+        row.addWidget(QLabel("时间范围:"))
+        self.rollup_start_date = QDateEdit()
+        self.rollup_start_date.setCalendarPopup(True)
+        self.rollup_start_date.setDisplayFormat("yyyy-MM-dd")
+        self.rollup_start_date.setToolTip("区间起始日期")
+        row.addWidget(self.rollup_start_date)
+        row.addWidget(QLabel("—"))
+        self.rollup_end_date = QDateEdit()
+        self.rollup_end_date.setCalendarPopup(True)
+        self.rollup_end_date.setDisplayFormat("yyyy-MM-dd")
+        self.rollup_end_date.setToolTip("区间结束日期")
+        row.addWidget(self.rollup_end_date)
+        self.rollup_apply_btn = QPushButton("应用")
+        self.rollup_apply_btn.clicked.connect(self._refresh_rollup)
+        row.addWidget(self.rollup_apply_btn)
+        self.rollup_reset_btn = QPushButton("全量")
+        self.rollup_reset_btn.clicked.connect(self._reset_rollup_range)
+        row.addWidget(self.rollup_reset_btn)
         row.addStretch()
         v.addLayout(row)
 
@@ -1948,12 +2024,36 @@ class MainWindow(QWidget):
         self.rollup_hint.setWordWrap(True)
         v.addWidget(self.rollup_hint)
 
-        split = QSplitter(Qt.Vertical)
-        split.setChildrenCollapsible(False)
+        self.rollup_splitter = QSplitter(Qt.Horizontal)
+        self.rollup_splitter.setChildrenCollapsible(False)
 
-        daily_group_box = QGroupBox("单组单日新增总时长")
+        range_box = QGroupBox("区间内单组新增总时长")
+        range_v = QVBoxLayout(range_box)
+        self.range_group_hint = QLabel("请选择一个时间范围。")
+        self.range_group_hint.setStyleSheet(MUTED_TEXT_STYLE)
+        self.range_group_hint.setWordWrap(True)
+        range_v.addWidget(self.range_group_hint)
+        self.range_group_table = QTableWidget(0, 5)
+        self.range_group_table.setHorizontalHeaderLabels(
+            ["分组", "新增小时", "新增episodes", "数据集数", "占比%"])
+        self.range_group_table.setSortingEnabled(True)
+        self.range_group_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.range_group_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.range_group_table.verticalHeader().setVisible(False)
+        range_hdr = self.range_group_table.horizontalHeader()
+        range_hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        for col in range(1, 5):
+            range_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
+        range_v.addWidget(self.range_group_table, 1)
+        self.rollup_plot = pg.PlotWidget(title="各分组小时数")
+        self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
+        range_v.addWidget(self.rollup_plot, 1)
+        self.rollup_table = self.range_group_table
+        self.rollup_splitter.addWidget(range_box)
+
+        daily_group_box = QGroupBox("区间内按日明细")
         daily_group_v = QVBoxLayout(daily_group_box)
-        self.daily_group_hint = QLabel("按 Hugging Face commit history 分日，随当前分组维度统计真实新增小时。")
+        self.daily_group_hint = QLabel("按 Hugging Face commit history 分日，展示所选时间范围内的每日新增小时。")
         self.daily_group_hint.setStyleSheet(MUTED_TEXT_STYLE)
         daily_group_v.addWidget(self.daily_group_hint)
         self.daily_group_table = QTableWidget(0, 5)
@@ -1968,35 +2068,20 @@ class MainWindow(QWidget):
         daily_hdr.setSectionResizeMode(1, QHeaderView.Stretch)
         for col in range(2, 5):
             daily_hdr.setSectionResizeMode(col, QHeaderView.ResizeToContents)
-        daily_group_v.addWidget(self.daily_group_table, 1)
-        split.addWidget(daily_group_box)
+        self.rollup_daily_splitter = QSplitter(Qt.Vertical)
+        self.rollup_daily_splitter.setChildrenCollapsible(False)
+        self.rollup_daily_splitter.addWidget(self.daily_group_table)
+        self.rollup_daily_splitter.addWidget(self._build_rollup_trends_box())
+        self.rollup_daily_splitter.setStretchFactor(0, 5)
+        self.rollup_daily_splitter.setStretchFactor(1, 2)
+        self.rollup_daily_splitter.setSizes([500, 190])
+        daily_group_v.addWidget(self.rollup_daily_splitter, 1)
+        self.rollup_splitter.addWidget(daily_group_box)
 
-        summary = QWidget()
-        summary_v = QVBoxLayout(summary)
-        summary_v.setContentsMargins(0, 0, 0, 0)
-        summary_split = QSplitter(Qt.Vertical)
-        summary_split.setChildrenCollapsible(False)
-
-        self.rollup_table = QTableWidget(0, 5)
-        self.rollup_table.setHorizontalHeaderLabels(
-            ["分组", "数据集数", "episodes", "小时", "占比%"])
-        self.rollup_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.rollup_table.verticalHeader().setVisible(False)
-        self.rollup_table.horizontalHeader().setSectionResizeMode(
-            0, QHeaderView.Stretch)
-        summary_split.addWidget(self.rollup_table)
-        self.rollup_plot = pg.PlotWidget(title="各分组小时数")
-        self.rollup_plot.showGrid(x=False, y=True, alpha=0.3)
-        summary_split.addWidget(self.rollup_plot)
-        summary_split.setStretchFactor(0, 2)
-        summary_split.setStretchFactor(1, 3)
-        summary_split.setSizes([320, 480])
-        summary_v.addWidget(summary_split, 1)
-        split.addWidget(summary)
-        split.setStretchFactor(0, 2)
-        split.setStretchFactor(1, 3)
-        split.setSizes([360, 760])
-        v.addWidget(split, 1)
+        self.rollup_splitter.setStretchFactor(0, 3)
+        self.rollup_splitter.setStretchFactor(1, 4)
+        self.rollup_splitter.setSizes([620, 760])
+        v.addWidget(self.rollup_splitter, 1)
         return w
 
     # ---- 数据集编辑 tab (edit prompt / rename → new copy, optional push) ---- #
@@ -2412,11 +2497,13 @@ class MainWindow(QWidget):
         self.edit_result.setText("")
         self._edit_worker = EditWorker(str(src), str(dst), replacements)
         self._edit_worker.done.connect(self._on_edit_done)
-        self._edit_worker.error.connect(self._on_error)
+        self._edit_worker.error.connect(self._on_worker_error)
+        self._edit_worker.finished.connect(
+            lambda worker=self._edit_worker:
+            self._on_one_shot_worker_finished("_edit_worker", worker))
         self._edit_worker.start()
 
     def _on_edit_done(self, dst_dir, n_changed):
-        self._set_busy(False)
         self._last_copy_dir = Path(dst_dir)
         self._last_copy_leaf = Path(dst_dir).name
         self.btn_push_copy.setEnabled(True)
@@ -2454,11 +2541,13 @@ class MainWindow(QWidget):
         self._push_worker = PushWorker(
             str(self._last_copy_dir), repo_id, self.token, private=True)
         self._push_worker.done.connect(self._on_push_done)
-        self._push_worker.error.connect(self._on_error)
+        self._push_worker.error.connect(self._on_worker_error)
+        self._push_worker.finished.connect(
+            lambda worker=self._push_worker:
+            self._on_one_shot_worker_finished("_push_worker", worker))
         self._push_worker.start()
 
     def _on_push_done(self, url):
-        self._set_busy(False)
         msg = f"上传完成: {url}"
         self.edit_result.setText(msg)
         self.status.setText(msg)
@@ -2601,11 +2690,13 @@ class MainWindow(QWidget):
         self._op_worker = LerobotOpWorker(spec)
         self._op_worker.log.connect(self.status.setText)
         self._op_worker.done.connect(self._on_op_done)
-        self._op_worker.error.connect(self._on_error)
+        self._op_worker.error.connect(self._on_worker_error)
+        self._op_worker.finished.connect(
+            lambda worker=self._op_worker:
+            self._on_one_shot_worker_finished("_op_worker", worker))
         self._op_worker.start()
 
     def _on_op_done(self, result):
-        self._set_busy(False)
         outs = result.get("outputs", [])
         lines = [f"{o['repo_id']}  ({o['episodes']} eps / {o['frames']} frames)\n  → {o['root']}"
                  for o in outs]
@@ -2761,7 +2852,7 @@ class MainWindow(QWidget):
     def _refresh_all(self):
         self._refresh_kpis()
         self._refresh_table()
-        self._refresh_trends()
+        self._set_rollup_range_defaults()
         self._refresh_rollup()
 
     def _show_stale_banner(self, snap):
@@ -2785,6 +2876,53 @@ class MainWindow(QWidget):
 
     def _current_deltas(self):
         return dd.hf_last_modified_dataset_deltas(self.report, self.history, self.hf_changes)
+
+    def _rollup_date_bounds(self):
+        dates = set()
+        for row in self.history or []:
+            if row.get("date"):
+                dates.add(row["date"])
+        if self.report and self.report.get("date"):
+            dates.add(self.report["date"])
+        try:
+            for row in dd.hf_change_rows(self.hf_changes):
+                if row.get("date"):
+                    dates.add(row["date"])
+        except Exception:
+            pass
+        if not dates:
+            return "", ""
+        return min(dates), max(dates)
+
+    def _set_rollup_range_defaults(self, force=False):
+        if not hasattr(self, "rollup_start_date") or not hasattr(self, "rollup_end_date"):
+            return
+        if self._rollup_range_initialized and not force:
+            return
+        start, end = self._rollup_date_bounds()
+        if start and end:
+            start_q = qdate_from_yymmdd(start)
+            end_q = qdate_from_yymmdd(end)
+            if start_q.isValid() and end_q.isValid():
+                self.rollup_start_date.setDate(start_q)
+                self.rollup_end_date.setDate(end_q)
+        self._rollup_range_initialized = True
+
+    def _selected_rollup_range(self):
+        if not hasattr(self, "rollup_start_date") or not hasattr(self, "rollup_end_date"):
+            return "", ""
+        start = self.rollup_start_date.date().toString("yyMMdd")
+        end = self.rollup_end_date.date().toString("yyMMdd")
+        if start and end and start > end:
+            start, end = end, start
+            self.rollup_start_date.setDate(qdate_from_yymmdd(start))
+            self.rollup_end_date.setDate(qdate_from_yymmdd(end))
+        return start, end
+
+    def _reset_rollup_range(self):
+        self._rollup_range_initialized = False
+        self._set_rollup_range_defaults(force=True)
+        self._refresh_rollup()
 
     def _refresh_baseline_hint(self):
         """Spell out the Hugging Face commit-diff basis for dashboard highlights."""
@@ -3028,7 +3166,7 @@ class MainWindow(QWidget):
         """Show only the centered fallback label (nothing selected)."""
         self.prompt_empty.setText(msg)
         self.prompt_empty.setVisible(True)
-        self.detail_stack.setVisible(False)
+        self.detail_scroll.setVisible(False)
         self.report_progress.setVisible(False)
 
     def _on_dataset_selected(self):
@@ -3050,7 +3188,7 @@ class MainWindow(QWidget):
         # Checks run off the record itself (name / duration / prompt), so the
         # panel is useful for any selected row even before a full pull.
         self.prompt_empty.setVisible(False)
-        self.detail_stack.setVisible(True)
+        self.detail_scroll.setVisible(True)
 
         self._pico_seq += 1  # invalidate a scan belonging to a previous row
 
@@ -3124,6 +3262,8 @@ class MainWindow(QWidget):
         worker.done.connect(
             lambda done_seq, key, result, error:
             self._on_doctor_done(done_seq, key, result, error, cache_key))
+        worker.finished.connect(
+            lambda worker=worker: self._forget_worker("_doctor_workers", worker))
         self._doctor_workers.append(worker)
         worker.start()
 
@@ -3318,6 +3458,7 @@ class MainWindow(QWidget):
         self.btn_quality_cancel.setEnabled(False)
         self.quality_progress.setVisible(False)
         if report_dir and Path(report_dir).is_dir():
+            self._quality_status[name] = "已检查"
             self._quality_reports[name] = report_dir
             self._quality_records[name] = {
                 "status": "已检查", "report_dir": report_dir,
@@ -3436,9 +3577,11 @@ class MainWindow(QWidget):
         if answer != QMessageBox.Yes:
             return
         shutil.rmtree(report_dir.parent, ignore_errors=True)
+        self._quality_status[name] = "未检查"
         self._quality_reports.pop(name, None)
         self._quality_records.pop(name, None)
         self._save_quality_records()
+        self._update_quality_status_cells(name)
         self._refresh_quality_report_panel()
 
     def on_clear_quality_cache(self):
@@ -3470,6 +3613,8 @@ class MainWindow(QWidget):
             seq,
         )
         worker.done.connect(self._on_pico_check_done)
+        worker.finished.connect(
+            lambda worker=worker: self._forget_worker("_pico_workers", worker))
         self._pico_workers.append(worker)
         worker.start()
 
@@ -3555,7 +3700,7 @@ class MainWindow(QWidget):
         item = QTreeWidgetItem([message, "", ""])
         item.setForeground(0, QBrush(QColor("#999999")))
         self.episode_length_tree.addTopLevelItem(item)
-        self.episode_length_tree.setFirstItemColumnSpanned(item, True)
+        item.setFirstColumnSpanned(True)
 
     def _refresh_episode_lengths(self, d):
         """Populate duration ranges and their episode rows from local metadata."""
@@ -3614,6 +3759,8 @@ class MainWindow(QWidget):
         """Fill STATISTICS / FILTERING / ACTION INSIGHTS from the viewer /report
         analysis for the selected dataset. Fetched in a background thread (can
         take tens of seconds); cached per session; stale selections ignored."""
+        if self._closing:
+            return
         self._report_seq += 1
         seq = self._report_seq
         if not self.viewer.is_ready():
@@ -3630,6 +3777,8 @@ class MainWindow(QWidget):
         self._report_set_note("分析中…（首次约 10–30s）", busy=True)
         w = ReportWorker(self.viewer, rel, seq)
         w.done.connect(self._on_report_done)
+        w.finished.connect(
+            lambda worker=w: self._forget_worker("_report_workers", worker))
         self._report_workers.append(w)
         w.start()
 
@@ -3878,31 +4027,160 @@ class MainWindow(QWidget):
                 parent.addChild(child)
             parent.setExpanded(True)
 
-    def _refresh_trends(self):
-        series = dd.daily_series(self.history)
-        self.daily_plot.clear()
-        self.cum_plot.clear()
-        if not series:
+    def _refresh_trends(self, daily_rows=None, date_from="", date_to="",
+                        range_label="全部日期"):
+        if not hasattr(self, "trend_plot"):
+            return
+        daily_rows = daily_rows or []
+        series = self._trend_series_from_daily_rows(daily_rows, date_from, date_to)
+        self.trend_plot.clear()
+        self.trend_cum_view.clear()
+        self.trend_plot.hideAxis("right")
+        self.trend_plot.getAxis("left").setLabel("小时")
+        self.trend_plot.setTitle(f"{range_label} 每日新增与累计小时数")
+        if not self.history and not daily_rows:
             self.trend_hint.setText(
                 "暂无历史数据。执行「仅拉取统计信息」或「拉取组织及其下所有数据集」后按天积累趋势。")
             return
+        if not series:
+            self.trend_hint.setText("当前时间范围内暂无可归因到真实日期的新增数据。")
+            return
         self.trend_hint.setText(
-            "" if len(series) >= 2 else "当前仅 1 天数据，多日拉取后可见增长趋势。")
-        # Categorical x = only days that were actually pulled, packed side by side
-        # (未统计的日期不占位，不留空白). fmt_day makes labels read 07-03 not 260703.
-        x = list(range(len(series)))
-        labels = [fmt_day_wd(s["date"]) for s in series]  # MM-DD + 周X
-        ticks = [list(zip(x, labels))]
-        bg = pg.BarGraphItem(x=x, height=[s.get("new_hours", 0) for s in series],
-                             width=0.8, brush="#4C8BF5")
-        self.daily_plot.addItem(bg)
-        self.daily_plot.getAxis("bottom").setTicks(ticks)
-        self.daily_plot.setXRange(-0.5, len(series) - 0.5, padding=0)
-        self.cum_plot.plot(x, [s.get("total_hours", 0) for s in series],
-                           pen=pg.mkPen("#34A853", width=2), symbol="o",
-                           symbolBrush="#34A853")
-        self.cum_plot.getAxis("bottom").setTicks(ticks)
-        self.cum_plot.setXRange(-0.5, len(series) - 0.5, padding=0.02)
+            "按 HF last_modified 真实归日；无新增日期按 0 显示，累计线为当前范围内新增小时累计。")
+        axis_from, axis_to = self._trend_date_bounds(series, date_from, date_to)
+        x, new_hours, total_hours = self._trend_plot_points(series, axis_from)
+        ticks = [self._trend_x_ticks(axis_from, axis_to)]
+        bg = pg.BarGraphItem(x=x, height=new_hours, width=0.8, brush="#4C8BF5")
+        self.trend_plot.addItem(bg)
+        if self._trend_uses_dual_axis(new_hours, total_hours):
+            self.trend_hint.setText(
+                self.trend_hint.text() + " 量级差距较大，累计小时使用右侧纵轴。")
+            self.trend_plot.getAxis("left").setLabel("新增小时")
+            self.trend_plot.getAxis("right").setLabel("累计小时")
+            self.trend_plot.showAxis("right")
+            self.trend_cum_view.addItem(pg.PlotDataItem(
+                x, total_hours,
+                pen=pg.mkPen("#34A853", width=2), symbol="o",
+                symbolBrush="#34A853"))
+            self._sync_trend_cum_view()
+            self.trend_plot.setYRange(0, (max(new_hours, default=0) or 1) * 1.08,
+                                      padding=0)
+            self.trend_cum_view.setYRange(0, (max(total_hours, default=0) or 1) * 1.08,
+                                          padding=0)
+        else:
+            self.trend_plot.plot(
+                x, total_hours,
+                pen=pg.mkPen("#34A853", width=2), symbol="o",
+                symbolBrush="#34A853")
+            max_y = max(max(new_hours, default=0), max(total_hours, default=0), 1)
+            self.trend_plot.setYRange(0, max_y * 1.08, padding=0)
+        self.trend_plot.getAxis("bottom").setTicks(ticks)
+        span = days_between(axis_from, axis_to)
+        span = span if span is not None else max(x, default=0)
+        self.trend_plot.setXRange(-0.5, span + 0.5, padding=0.02)
+
+    @staticmethod
+    def _trend_series_from_daily_rows(daily_rows, date_from="", date_to=""):
+        rows = [row for row in daily_rows if row.get("date")]
+        if not rows:
+            return []
+        dates = [row["date"] for row in rows]
+        axis_from = date_from or min(dates)
+        axis_to = date_to or max(dates)
+        span = days_between(axis_from, axis_to)
+        if span is None or span < 0:
+            return []
+        daily_hours = {(
+            dt.datetime.strptime(axis_from, "%y%m%d").date()
+            + dt.timedelta(days=offset)
+        ).strftime("%y%m%d"): 0.0 for offset in range(span + 1)}
+        for row in rows:
+            date = row.get("date")
+            if date not in daily_hours:
+                continue
+            daily_hours[date] += row.get("hours", 0) or 0
+        cumulative = 0.0
+        out = []
+        for date in sorted(daily_hours):
+            new_hours = round(daily_hours[date], 3)
+            cumulative = round(cumulative + new_hours, 3)
+            out.append({
+                "date": date,
+                "new_hours": new_hours,
+                "total_hours": cumulative,
+            })
+        return out
+
+    @staticmethod
+    def _trend_date_bounds(series, date_from="", date_to=""):
+        if date_from and date_to:
+            return date_from, date_to
+        dates = [row.get("date") for row in series if row.get("date")]
+        if not dates:
+            return date_from or "", date_to or ""
+        return date_from or min(dates), date_to or max(dates)
+
+    @staticmethod
+    def _trend_plot_points(series, axis_from):
+        points = []
+        for row in series:
+            offset = days_between(axis_from, row.get("date") or "")
+            if offset is not None:
+                points.append((
+                    offset,
+                    row.get("new_hours", 0),
+                    row.get("total_hours", 0),
+                ))
+        return (
+            [offset for offset, _new_hours, _total_hours in points],
+            [new_hours for _offset, new_hours, _total_hours in points],
+            [total_hours for _offset, _new_hours, total_hours in points],
+        )
+
+    @staticmethod
+    def _trend_uses_dual_axis(new_hours, total_hours):
+        max_new = max(new_hours, default=0) or 0
+        max_total = max(total_hours, default=0) or 0
+        if max_new <= 0 or max_total <= 0:
+            return False
+        return max_total / max_new >= 4
+
+    def _trend_x_ticks(self, date_from, date_to):
+        """Adaptive date labels for the compact trend chart's calendar axis.
+
+        Data points keep their real day offsets. Only labels are thinned so the
+        x-axis remains readable in the right-side panel.
+        """
+        span = days_between(date_from, date_to)
+        if span is None or span < 0:
+            return []
+        day_count = span + 1
+        width = max(1, self.trend_plot.width() if hasattr(self, "trend_plot") else 0)
+        target_px_per_label = 100
+        max_labels = max(7, min(12, width // target_px_per_label))
+        if day_count <= 7:
+            label_count = day_count
+        else:
+            max_labels_by_spacing = span // 2 + 1
+            label_count = max(7, min(day_count, max_labels, max_labels_by_spacing))
+        if day_count <= label_count:
+            offsets = list(range(day_count))
+        else:
+            offsets = [
+                round(i * span / (label_count - 1))
+                for i in range(label_count)
+            ]
+        start = dt.datetime.strptime(date_from, "%y%m%d").date()
+        return [
+            (offset, self._trend_x_label(
+                (start + dt.timedelta(days=offset)).strftime("%y%m%d")))
+            for offset in offsets
+        ]
+
+    @staticmethod
+    def _trend_x_label(yymmdd):
+        full = fmt_day(yymmdd)
+        return full[5:] if len(full) == 10 else full
 
     def _refresh_daily_group_table(self, rows, dim):
         self.daily_group_table.setSortingEnabled(False)
@@ -3930,24 +4208,54 @@ class MainWindow(QWidget):
         self.daily_group_table.sortItems(0, Qt.DescendingOrder)
 
     def _refresh_rollup(self):
+        self._set_rollup_range_defaults()
         self.rollup_table.setRowCount(0)
         self.rollup_plot.clear()
         self.rollup_hint.setText("")
         dim = self.dim_combo.currentText()
         key_fn = ROLLUP_DIMS[dim]
-        daily_rows = dd.hf_last_modified_daily_group_series(
+        range_from, range_to = self._selected_rollup_range()
+        range_text = f"{fmt_day(range_from)} ~ {fmt_day(range_to)}"
+        if range_from == range_to:
+            range_text = fmt_day(range_from)
+        if not range_from and not range_to:
+            range_text = "全部日期"
+        daily_rows = [
+            row for row in dd.hf_last_modified_daily_group_series(
             self.report, self.history, self.hf_changes, key_fn)
+            if dd._date_in_range(row.get("date") or "", range_from, range_to)
+        ]
         self._refresh_daily_group_table(daily_rows, dim)
+        self._refresh_trends(daily_rows, range_from, range_to, range_text)
+        if hasattr(self, "range_group_table"):
+            self.range_group_table.setSortingEnabled(False)
+            self.range_group_table.setRowCount(0)
+        if self.report:
+            self.rollup_hint.setText(f"当前时间范围：{range_text}")
         if not self.report:
             return
         if self.report.get("source") == "manual":
-            self.rollup_hint.setText("该手动快照仅包含总量，无法生成分组统计。")
+            self.rollup_hint.setText("该手动快照仅包含总量，无法按日期区间生成分组统计。")
+            rows = dd.rollup(self.report.get("datasets", []), key_fn)
+            self._render_rollup_summary(rows, "当前快照")
             self.rollup_plot.setTitle("各分组小时数")
             return
-        rows = dd.rollup(self.report.get("datasets", []), key_fn)
+        rows = dd.hf_last_modified_group_range_totals(
+            self.report, self.history, self.hf_changes, key_fn,
+            date_from=range_from, date_to=range_to)
+        self._render_rollup_summary(rows, range_text)
+
+    def _render_rollup_summary(self, rows, range_label):
         self.rollup_table.setRowCount(len(rows))
+        if hasattr(self, "range_group_hint"):
+            self.range_group_hint.setText(f"当前汇总范围：{range_label}")
+        self.rollup_hint.setText(f"当前时间范围：{range_label}")
+        total_hours = sum(g.get("hours") or 0 for g in rows) or 1
         for i, g in enumerate(rows):
-            vals = [g["group"], g["count"], g["episodes"], g["hours"], g["pct_hours"]]
+            hours = g.get("hours", 0)
+            episodes = g.get("episodes", 0)
+            datasets = g.get("datasets", g.get("count", 0))
+            vals = [g["group"], datasets, episodes, hours, round(100 * hours / total_hours, 1)]
             for j, v in enumerate(vals):
                 if j == 0:
                     item = QTableWidgetItem(str(v))
@@ -3980,8 +4288,9 @@ class MainWindow(QWidget):
         self.rollup_plot.setYRange(-0.5, n - 0.5, padding=0.02)
         max_h = max((g["hours"] for g in plot_rows), default=1) or 1
         self.rollup_plot.setXRange(0, max_h, padding=0.05)  # bars start at 0, no left gap
+        title = f"{range_label} 各分组小时数"
         self.rollup_plot.setTitle(
-            f"各分组小时数（前 {n}/{len(rows)}）" if len(rows) > n else "各分组小时数")
+            f"{title}（前 {n}/{len(rows)}）" if len(rows) > n else title)
 
     # ---- Login / visibility indicator ------------------------------------- #
     def on_switch_account(self):
@@ -4045,6 +4354,8 @@ class MainWindow(QWidget):
 
     def _refresh_identity(self, *_):
         """Kick off a background check of who we are + how many datasets we see."""
+        if self._closing:
+            return
         org = self.org_combo.currentText().strip()
         if not org:
             return
@@ -4055,10 +4366,28 @@ class MainWindow(QWidget):
         w = IdentityWorker(org, self.token)
         w.done.connect(lambda name, has, o, cnt, seq=seq:
                        self._on_identity(seq, name, has, o, cnt))
-        w.finished.connect(lambda w=w: self._id_workers.remove(w)
-                           if w in self._id_workers else None)
+        w.finished.connect(
+            lambda worker=w: self._forget_worker("_id_workers", worker))
         self._id_workers.append(w)  # hold a ref so the QThread isn't GC'd mid-run
         w.start()
+
+    def _forget_worker(self, attr, worker):
+        """Drop a completed short-lived QThread and schedule Qt-side deletion."""
+        workers = getattr(self, attr, None)
+        if workers is not None and worker in workers:
+            workers.remove(worker)
+        worker.deleteLater()
+
+    def _on_one_shot_worker_finished(self, attr, worker=None):
+        """Release an owned one-shot QThread after its native thread is stopped."""
+        worker = worker or self.sender()
+        if worker is getattr(self, attr, None):
+            setattr(self, attr, None)
+        if worker is self.worker:
+            self.worker = None
+        self._set_busy(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_identity(self, seq, name, has_token, org, count):
         # Only the most recent check may update the label — a slower older worker
@@ -4075,25 +4404,31 @@ class MainWindow(QWidget):
         self.identity_label.setText(f"{who} · {org} {cnt}")
         self.identity_label.setStyleSheet(f"color:{color}; font-weight:bold;")
 
-    def closeEvent(self, event):
-        # Stop the viewer subprocess we launched so it doesn't outlive the app.
-        try:
-            self.viewer.stop()
-        except Exception:
-            pass
-        if self.quality_worker and self.quality_worker.isRunning():
-            self.quality_worker.cancel()
-            self.quality_worker.wait(3000)
-        # Let any in-flight identity checks finish so the QThread isn't destroyed
-        # mid-run (Qt would otherwise warn / crash on close during a check).
-        for w in list(self._id_workers):
-            if not w.wait(2000):
-                w.terminate()
-                w.wait(1000)
-        for w in list(self._report_workers):
-            if not w.wait(2000):
-                w.terminate()
-                w.wait(1000)
+    def _prepare_shutdown(self):
+        if self._shutdown_done:
+            return
+        self._closing = True
+        self._id_seq += 1
+        self._report_seq += 1
+        self._doctor_seq += 1
+        self._pico_seq += 1
+        if hasattr(self, "speed_timer"):
+            self.speed_timer.stop()
+        if hasattr(self, "quality_status_timer"):
+            self.quality_status_timer.stop()
+        # Let in-flight background reads finish so QThreads are not destroyed
+        # mid-run. Identity can be a network call on startup; give it a real
+        # chance before falling back to terminate.
+        for attr, timeout_ms in (
+            ("_id_workers", 10000),
+            ("_report_workers", 10000),
+            ("_doctor_workers", 10000),
+            ("_pico_workers", 10000),
+        ):
+            for w in list(getattr(self, attr, [])):
+                if not w.wait(timeout_ms):
+                    w.terminate()
+                    w.wait(2000)
         # Same for the one-shot workers (pull/stats/download/edit/push/op) and
         # especially the deep quality scan, which can run for minutes: ask it
         # to cancel, give it a moment, then terminate as a last resort —
@@ -4105,13 +4440,23 @@ class MainWindow(QWidget):
             if not qw.wait(8000):
                 qw.terminate()
                 qw.wait(2000)
-        for name in ("worker", "dl_worker", "_edit_worker", "_push_worker",
-                     "_op_worker"):
+        for name in ("worker", "_pull_worker", "_check_worker", "dl_worker",
+                     "_edit_worker", "_push_worker", "_op_worker"):
             w = getattr(self, name, None)
             if w is not None and hasattr(w, "wait") and w.isRunning():
                 if not w.wait(5000):
                     w.terminate()
                     w.wait(2000)
+        # Stop the viewer subprocess we launched after viewer-backed workers have
+        # settled, so their HTTP calls do not hang on a disappearing service.
+        try:
+            self.viewer.stop()
+        except Exception:
+            pass
+        self._shutdown_done = True
+
+    def closeEvent(self, event):
+        self._prepare_shutdown()
         super().closeEvent(event)
 
     # ---- Button handlers -------------------------------------------------- #
@@ -4139,12 +4484,15 @@ class MainWindow(QWidget):
         self._prev_t = time.monotonic()
         self.speed_label.setText("0.0 B/s")
         self.speed_timer.start()
-        self.worker = PullWorker(org, OUT_DIR, self.token)
-        self.worker.log.connect(self.status.setText)
-        self.worker.progress.connect(self._on_progress)
-        self.worker.done.connect(self._on_pull_done)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
+        worker = PullWorker(org, OUT_DIR, self.token)
+        self.worker = worker
+        self._pull_worker = worker
+        worker.log.connect(self.status.setText)
+        worker.progress.connect(self._on_progress)
+        worker.done.connect(self._on_pull_done)
+        worker.error.connect(self._on_pull_error)
+        worker.finished.connect(self._on_pull_worker_finished)
+        worker.start()
 
     def on_download_selected(self):
         """Download ONLY the dataset selected in the 看板 table (fast path)."""
@@ -4161,21 +4509,49 @@ class MainWindow(QWidget):
         self.speed_label.setText("0.0 B/s")
         self.speed_timer.start()
         self.status.setText(f"开始下载 {repo_id} ...")
-        self.dl_worker = DownloadOneWorker(repo_id, OUT_DIR, self.token)
-        self.dl_worker.log.connect(self.status.setText)
-        self.dl_worker.done.connect(self._on_download_one_done)
-        self.dl_worker.error.connect(self._on_error)
-        self.dl_worker.start()
+        worker = DownloadOneWorker(repo_id, OUT_DIR, self.token)
+        self.dl_worker = worker
+        worker.log.connect(self.status.setText)
+        worker.done.connect(self._on_download_one_done)
+        worker.error.connect(self._on_download_error)
+        worker.finished.connect(self._on_download_worker_finished)
+        worker.start()
 
     def _on_download_one_done(self, local_dir):
         self._stop_speed()
         self.bar.setMaximum(1)
         self.bar.setValue(1)
-        self._set_busy(False)
         self._refresh_table()  # the newly downloaded row now shows 已下载
+        self._download_done_path = local_dir
         msg = f"下载完成: {local_dir}"
         self.status.setText(msg)
-        QMessageBox.information(self, "完成", f"已下载到本地:\n{local_dir}")
+
+    def _on_download_error(self, msg):
+        """Show a download failure; finished releases the worker/busy lock."""
+        self._stop_speed()
+        self._download_done_path = ""
+        self.status.setText(f"错误: {msg}")
+        QMessageBox.critical(self, "错误", msg)
+
+    def _on_download_worker_finished(self):
+        """Release the download worker only after QThread has stopped."""
+        worker = self.sender()
+        if worker is self.dl_worker:
+            self.dl_worker = None
+        self._set_busy(False)
+        if worker is not None:
+            worker.deleteLater()
+        local_dir = self._download_done_path
+        self._download_done_path = ""
+        if local_dir:
+            box = QMessageBox(
+                QMessageBox.Information, "完成", f"已下载到本地:\n{local_dir}",
+                QMessageBox.Ok, self)
+            box.setAttribute(Qt.WA_DeleteOnClose)
+            self._download_message_box = box
+            box.finished.connect(
+                lambda *_: setattr(self, "_download_message_box", None))
+            box.open()
 
     def on_stats(self):
         org = self.org_combo.currentText().strip()
@@ -4334,13 +4710,29 @@ class MainWindow(QWidget):
         self.hf_changes = dd.load_hf_change_history()
         self._refresh_all()
         self._hide_stale_banner()  # data is now live
-        self._set_busy(False)
         fails = len(report.get("failures", []))
         msg = f"拉取完成: {report['count']}/{report['requested']} 个数据集"
         if fails:
             msg += f"，{fails} 个失败"
         self.status.setText(
-            msg + (f"  ->  {out_path}" if out_path else "") + viewer_note)
+            msg + (f"  ->  {out_path}" if out_path else ""))
+
+    def _on_pull_error(self, msg):
+        """Show a pull failure; finished releases the worker/busy lock."""
+        self._stop_speed()
+        self.status.setText(f"错误: {msg}")
+        QMessageBox.critical(self, "错误", msg)
+
+    def _on_pull_worker_finished(self):
+        """Release the pull worker only after QThread has stopped."""
+        worker = self.sender()
+        if worker is self._pull_worker:
+            self._pull_worker = None
+        if worker is self.worker:
+            self.worker = None
+        self._set_busy(False)
+        if worker is not None:
+            worker.deleteLater()
 
     def _on_stats_done(self, report):
         self.report = report
@@ -4357,7 +4749,6 @@ class MainWindow(QWidget):
             hist_note = f"（历史未写入: {exc}）"
         self._refresh_all()
         self._hide_stale_banner()  # data is now live
-        self._set_busy(False)
         fails = len(report.get("failures", []))
         msg = f"统计完成: {report['count']}/{report['requested']} 个数据集，共 {report['total_hours']} 小时"
         if fails:
@@ -4371,13 +4762,17 @@ class MainWindow(QWidget):
             return
         self._set_busy(True)
         self.status.setText(f"检查 {org} 是否有新增数据集 ...")
-        self.worker = CheckWorker(org, OUT_DIR, self.token)
-        self.worker.result.connect(self._on_check_result)
-        self.worker.error.connect(self._on_error)
-        self.worker.start()
+        worker = CheckWorker(org, OUT_DIR, self.token)
+        self.worker = worker
+        self._check_worker = worker
+        worker.result.connect(self._on_check_result)
+        worker.error.connect(self._on_worker_error)
+        worker.finished.connect(
+            lambda worker=worker:
+            self._on_one_shot_worker_finished("_check_worker", worker))
+        worker.start()
 
     def _on_check_result(self, new, removed, hub_count, local_count):
-        self._set_busy(False)
         self.status.setText(
             f"Hub {hub_count} 个 / 本地 {local_count} 个，"
             f"新增 {len(new)}，本地多出 {len(removed)}")
@@ -4400,6 +4795,12 @@ class MainWindow(QWidget):
     def _on_error(self, msg):
         self._stop_speed()
         self._set_busy(False)
+        self.status.setText(f"错误: {msg}")
+        QMessageBox.critical(self, "错误", msg)
+
+    def _on_worker_error(self, msg):
+        """Show a worker failure; finished releases the worker/busy lock."""
+        self._stop_speed()
         self.status.setText(f"错误: {msg}")
         QMessageBox.critical(self, "错误", msg)
 

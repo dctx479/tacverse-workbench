@@ -57,12 +57,6 @@ git --version
 - Ubuntu：如未安装，执行 `sudo apt update && sudo apt install -y python3 python3-pip git`。
 - macOS：可使用系统已有的 Python 3，或执行 `brew install python git`。不使用 Homebrew 时也可从 python.org 安装。
 
-> `pyarrow` 用于读/写数据集的 `meta/*.parquet`（「数据集编辑」页签改 prompt 时会写回）；
-> 上传编辑后的副本用已有的 `huggingface_hub`。在 `lerobot-xense` 环境里这些通常已安装。
-> Episode 深度质量检查用 OpenCV 解码视频，用 Matplotlib 生成轨迹图；视频切片优先调用
-> 系统 `ffmpeg` 转成浏览器可播放的 H.264，未安装时会回退到 `imageio-ffmpeg`。
-> 删除 / 拆分 / 合并 / 增删特征会以子进程方式调用 LeRobot 官方 `dataset_tools`，因此需要同一解释器中安装 `lerobot`；改名 / 改 Prompt 是本地 pyarrow 实现，不依赖 `lerobot`。
-
 如果是首次克隆仓库，建议同时拉取 Viewer 子模块：
 
 ```bash
@@ -75,21 +69,31 @@ git clone --recurse-submodules https://github.com/dctx479/tacverse-workbench.git
 git submodule update --init --recursive
 ```
 
-### 2. 安装基础依赖
+### 2. 完整安装依赖
+
+完整功能包括 GUI、统计/下载、改名 / 改 Prompt、深度质量检查、Viewer / Doctor，以及调用 LeRobot 官方 `dataset_tools` 的删除 / 拆分 / 合并 / 增删特征。安装 [Bun](https://bun.sh/) 后，在项目根目录执行：
 
 ```powershell
 # Windows PowerShell
 py -3 -m pip install --upgrade pip
-py -3 -m pip install huggingface_hub PySide6 pyqtgraph pyarrow
+py -3 scripts/install_all.py
 ```
 
 ```bash
 # Ubuntu / macOS
 python3 -m pip install --upgrade pip
-python3 -m pip install huggingface_hub PySide6 pyqtgraph pyarrow
+python3 scripts/install_all.py
 ```
 
-这些依赖足以运行 GUI、拉取统计信息以及使用改名 / 改 Prompt 功能。使用 `python -m pip` 的形式可以确保依赖安装到实际启动程序的解释器中。
+`scripts/install_all.py` 会安装 `requirements-full.txt`，初始化 `third_party/lerobot_viewer` 子模块，并执行 `bun install`。使用 `py -3` / `python3` 的形式可以确保依赖安装到实际启动程序的解释器中。
+
+如果当前机器暂时不需要 LeRobot 数据集操作，可改用轻量安装：
+
+```bash
+python scripts/install_all.py --skip-lerobot
+```
+
+如果只想安装 Python 依赖、不安装 Viewer，可加 `--skip-viewer`。
 
 > 某些 Linux 发行版会限制向系统 Python 安装包。如果 `pip` 提示 `externally-managed-environment`，请使用发行版提供的 Python 包、conda/mamba，或自行选择 `venv`；这不是本项目的强制要求。
 
@@ -112,41 +116,19 @@ sudo apt install -y libxcb-cursor0
 
 如果仍提示缺少 xcb 库，请根据报错用当前 Linux 发行版的包管理器安装对应库；无桌面环境的服务器还需要 X11/Wayland 会话才能显示 GUI。
 
-### 4. 可选功能依赖
-
-基础工作台不依赖以下组件，只在使用对应功能时安装。
-
-**本地视频质量检查与图表：**
-
-```powershell
-# Windows PowerShell
-py -3 -m pip install opencv-python imageio-ffmpeg matplotlib
-```
-
-```bash
-# Ubuntu / macOS
-python3 -m pip install opencv-python imageio-ffmpeg matplotlib
-```
-
-**删除 / 拆分 / 合并 / 增删特征：** 这些操作调用 LeRobot 官方 `dataset_tools`，因此需要在启动工作台的同一个解释器中安装 `lerobot`。
-
-```powershell
-# Windows PowerShell
-py -3 -m pip install lerobot
-py -3 -c "import lerobot; print('lerobot ready')"
-```
-
-```bash
-# Ubuntu / macOS
-python3 -m pip install lerobot
-python3 -c "import lerobot; print('lerobot ready')"
-```
+### 4. 单独安装 Viewer
 
 **Viewer：** 需要仓库子模块、[Bun](https://bun.sh/) 和前端依赖。安装 Bun 后，在项目根目录执行：
 
 ```bash
+python scripts/install_viewer.py
+```
+
+也可以手动执行：
+
+```bash
 git submodule update --init --recursive
-cd vendor/lerobot_viewer
+cd third_party/lerobot_viewer
 bun install
 cd ../..
 ```

@@ -541,6 +541,35 @@ class PullDatasetRetryTests(unittest.TestCase):
         self.assertTrue(path.startswith("\\\\?\\"))
         self.assertTrue(path.endswith("example-dataset"))
 
+
+class LastModifiedRangeTests(unittest.TestCase):
+    def test_group_range_totals_filter_and_sum_by_date_range(self):
+        rows = [
+            {"date": "260101", "group": "alice", "hours": 1.0, "episodes": 10, "datasets": 2},
+            {"date": "260102", "group": "alice", "hours": 2.0, "episodes": 20, "datasets": 1},
+            {"date": "260103", "group": "bob", "hours": 3.0, "episodes": 30, "datasets": 1},
+        ]
+        report = {"datasets": []}
+        with patch.object(dd, "hf_last_modified_daily_group_series", return_value=rows):
+            grouped = dd.hf_last_modified_group_range_totals(
+                report, [], {}, lambda d: d.get("uploader"),
+                date_from="260102", date_to="260103")
+            totals = dd.hf_last_modified_range_totals(
+                report, [], {}, date_from="260102", date_to="260103")
+
+        self.assertEqual([
+            {"group": "bob", "hours": 3.0, "episodes": 30, "datasets": 1},
+            {"group": "alice", "hours": 2.0, "episodes": 20, "datasets": 1},
+        ], grouped)
+        self.assertEqual({
+            "date_from": "260102",
+            "date_to": "260103",
+            "hours": 5.0,
+            "episodes": 50,
+            "datasets": 2,
+        }, totals)
+
+
 class PullDatasetRetryTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()

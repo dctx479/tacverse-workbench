@@ -1646,6 +1646,53 @@ def hf_last_modified_group_totals(current_report, history, change_history, key_f
     return rows
 
 
+def _date_in_range(date, date_from=None, date_to=None):
+    if date_from and date < date_from:
+        return False
+    if date_to and date > date_to:
+        return False
+    return True
+
+
+def hf_last_modified_group_range_totals(
+        current_report, history, change_history, key_fn,
+        date_from=None, date_to=None):
+    rows = [
+        row for row in hf_last_modified_daily_group_series(
+            current_report, history, change_history, key_fn)
+        if _date_in_range(row.get("date") or "", date_from, date_to)
+    ]
+    groups = {}
+    for row in rows:
+        key = row.get("group") or "—"
+        group = groups.setdefault(
+            key, {"group": key, "hours": 0.0, "episodes": 0, "datasets": 0})
+        group["hours"] += row.get("hours") or 0
+        group["episodes"] += row.get("episodes") or 0
+        group["datasets"] += row.get("datasets") or 0
+    out = list(groups.values())
+    for row in out:
+        row["hours"] = round(row["hours"], 3)
+    out.sort(key=lambda row: row["hours"], reverse=True)
+    return out
+
+
+def hf_last_modified_range_totals(
+        current_report, history, change_history, date_from=None, date_to=None):
+    rows = hf_last_modified_daily_group_series(
+        current_report, history, change_history, lambda dataset: "__all__")
+    totals = {"date_from": date_from or "", "date_to": date_to or "",
+              "hours": 0.0, "episodes": 0, "datasets": 0}
+    for row in rows:
+        if not _date_in_range(row.get("date") or "", date_from, date_to):
+            continue
+        totals["hours"] += row.get("hours") or 0
+        totals["episodes"] += row.get("episodes") or 0
+        totals["datasets"] += row.get("datasets") or 0
+    totals["hours"] = round(totals["hours"], 2)
+    return totals
+
+
 def find_baseline(current_report, history):
     """Return the snapshot to diff `current_report` against: the last pull of the
     most recent *earlier day*.
