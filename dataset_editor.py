@@ -56,12 +56,10 @@ def validate_leaf(leaf):
     return leaf
 
 
-def default_copy_dir(new_leaf, out_dir="pulls", today=None):
-    """Compute `pulls/<%y%m%d>/<new_leaf>/` for a fresh copy (date layout mirrors
-    download_dataset.run_pull). Does not create anything."""
+def default_copy_dir(new_leaf, out_dir="datasets/TacVerse", today=None):
+    """Compute an organization-rooted output path with no date subdirectory."""
     new_leaf = validate_leaf(new_leaf)
-    stamp = (today or _dt.date.today()).strftime("%y%m%d")
-    return Path(out_dir) / stamp / new_leaf
+    return Path(out_dir) / new_leaf
 
 
 # --- copy ------------------------------------------------------------------

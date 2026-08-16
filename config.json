@@ -61,6 +61,20 @@
       "report_dir": ".quality_reports",
       "remote_max_episodes": 8,
       "max_issues": 80
+    },
+    "pico_motracker": {
+      "source": "observation.state",
+      "hands": [
+        "left",
+        "right"
+      ],
+      "axis_step_threshold": {
+        "x": 0.2,
+        "y": 0.2,
+        "z": 0.2
+      },
+      "xyz_step_threshold": 0.35,
+      "max_event_details": 1000
     }
   },
   "uploader_names": {
@@ -72,6 +86,10 @@
     "fza1796262052": "方占奥",
     "SkyhaoLi": "李天浩",
     "WBH333": "王宝合",
+    "XR-Bot0": "邬思彤",
+    "XR-Bot1": "邬思彤",
+    "XR-Bot3": "洪锐",
+    "XR-Bot4": "洪锐",
     "dctx": "白伟杰",
     "etince11e": "姜毅峰",
     "hubobi": "胡博",

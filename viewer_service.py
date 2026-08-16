@@ -19,11 +19,12 @@ import signal
 import socket
 import subprocess
 import time
+import urllib.error
 import urllib.request
 import webbrowser
 from pathlib import Path
 
-VIEWER_DIR = Path(__file__).resolve().parent / "vendor" / "lerobot_viewer"
+VIEWER_DIR = Path(__file__).resolve().parent / "third_party" / "lerobot_viewer"
 DEFAULT_PORT = 3000
 
 
@@ -59,6 +60,81 @@ def _http_ok(url, timeout=1.0):
             return 200 <= resp.status < 500
     except Exception:
         return False
+
+
+def _listener_pids(port):
+    """Return PIDs with a TCP LISTEN socket on `port` (best effort)."""
+    port = int(port)
+    pids = set()
+    try:
+        import psutil
+    except Exception:
+        psutil = None
+
+    if psutil is not None:
+        try:
+            for conn in psutil.net_connections(kind="tcp"):
+                if (conn.status == psutil.CONN_LISTEN and conn.laddr
+                        and conn.laddr.port == port and conn.pid):
+                    pids.add(conn.pid)
+        except Exception:
+            pass
+        if pids:
+            return sorted(pids)
+
+    for args in (
+        ("lsof", "-t", f"-iTCP:{port}", "-sTCP:LISTEN"),
+        ("fuser", "-n", "tcp", str(port)),
+    ):
+        try:
+            out = subprocess.run(
+                args, capture_output=True, text=True, timeout=2)
+        except Exception:
+            continue
+        for token in out.stdout.split():
+            candidate = token.split("/")[-1]
+            if candidate.isdigit():
+                pids.add(int(candidate))
+    return sorted(pids)
+
+
+def _process_environ(pid):
+    """Return a process environment dict, or {} when it cannot be read."""
+    try:
+        import psutil
+        return dict(psutil.Process(int(pid)).environ())
+    except Exception:
+        pass
+    env = {}
+    try:
+        raw = Path(f"/proc/{int(pid)}/environ").read_bytes()
+    except OSError:
+        return env
+    for item in raw.split(b"\0"):
+        if b"=" not in item:
+            continue
+        key, _, value = item.partition(b"=")
+        env[key.decode("utf-8", "replace")] = value.decode("utf-8", "replace")
+    return env
+
+
+def _listener_root(port):
+    """LOCAL_DATASET_ROOT of the process listening on `port`, or None."""
+    for pid in _listener_pids(port):
+        root = _process_environ(pid).get("LOCAL_DATASET_ROOT")
+        if root:
+            try:
+                return str(Path(root).resolve())
+            except OSError:
+                return str(root)
+    return None
+
+
+def _kill_pid(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except OSError:
+        pass
 
 
 class ViewerService:
@@ -132,11 +208,18 @@ class ViewerService:
 
         `wait=False` returns as soon as the process is spawned; poll status()
         for readiness. `wait=True` blocks until the home page answers or times
-        out. If the port is already served, the existing instance is reused.
+        out. If the port is already served with the same data root, the existing
+        instance is reused; a stale root is stopped and relaunched automatically.
         """
         self.root = str(Path(root).resolve())
         if _port_in_use(self.port):
-            return True, f"端口 {self.port} 已在运行，复用现有服务"
+            existing_root = _listener_root(self.port)
+            if existing_root and Path(existing_root).resolve() == Path(self.root).resolve():
+                return True, f"端口 {self.port} 已在运行，复用现有服务"
+            if existing_root is None:
+                return False, f"端口 {self.port} 已被其他服务占用，无法自动接管"
+            if not self.stop(timeout=3):
+                return False, f"端口 {self.port} 的旧 Viewer 未能停止，无法切换到 {self.root}"
         if not self.available():
             return False, f"viewer 未就绪（缺 node_modules）: {self.viewer_dir}"
         bun = find_bun()
@@ -171,21 +254,52 @@ class ViewerService:
             time.sleep(0.5)
         return False, f"启动超时（{timeout}s），可稍后重试或查看日志"
 
-    def stop(self):
-        """Terminate the managed process (and its group). Idempotent."""
+    def stop(self, timeout=5):
+        """Terminate the managed process group and any port listener.
+
+        This also works when the viewer was left running by an earlier
+        workbench session: the app only knows the port is occupied, not the
+        original Popen object.
+        """
         if self.proc and self.proc.poll() is None:
             try:
                 os.killpg(os.getpgid(self.proc.pid), signal.SIGTERM)
                 try:
-                    self.proc.wait(timeout=5)
+                    self.proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    try:
+                        self.proc.wait(timeout=1)
+                    except Exception:
+                        pass
             except Exception:
                 try:
                     self.proc.terminate()
                 except Exception:
                     pass
         self.proc = None
+
+        if not _port_in_use(self.port):
+            return True
+
+        deadline = time.time() + timeout
+        signaled = set()
+        while _port_in_use(self.port) and time.time() < deadline:
+            pids = _listener_pids(self.port)
+            if not pids:
+                break
+            for pid in pids:
+                if pid not in signaled:
+                    _kill_pid(pid, signal.SIGTERM)
+                    signaled.add(pid)
+            time.sleep(0.2)
+
+        if _port_in_use(self.port):
+            for pid in _listener_pids(self.port):
+                _kill_pid(pid, signal.SIGKILL)
+            time.sleep(0.3)
+
+        return not _port_in_use(self.port)
 
     # --- introspection (contract ②) --------------------------------------
     def dataset_count(self):
@@ -216,6 +330,57 @@ class ViewerService:
         if isinstance(data, dict) and data.get("ok") is False:
             return None, str(data.get("error") or "analysis failed")
         return data, None
+
+    def doctor(self, rel_path, max_episodes=25, episode_range=None,
+               checks=None, timeout=300, on_progress=None):
+        """Run the viewer's TypeScript Doctor endpoint.
+
+        The endpoint streams newline-delimited JSON progress events followed by
+        one result event.  This method stays Qt-free and reports progress via
+        ``on_progress(progress_dict)`` so the GUI can run it in a worker thread.
+        Returns ``(result_dict, None)`` on success or ``(None, error)``.
+        """
+        url = (f"{self.base_url}/api/local-datasets/"
+               f"{encode_dataset_path(rel_path)}/doctor?stream=1")
+        payload = {
+            "maxEpisodes": max_episodes,
+            "episodeRange": episode_range,
+        }
+        if checks is not None:
+            payload["checks"] = checks
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=timeout) as resp:
+                result = None
+                for raw_line in resp:
+                    if not raw_line.strip():
+                        continue
+                    event = json.loads(raw_line.decode("utf-8"))
+                    kind = event.get("type") if isinstance(event, dict) else None
+                    if kind == "progress":
+                        if on_progress:
+                            on_progress(event.get("progress") or {})
+                    elif kind == "result":
+                        result = event.get("result")
+                    elif kind == "error":
+                        return None, str(event.get("error") or "Doctor failed")
+                if result is None:
+                    return None, "Doctor stream ended without a result"
+                return result, None
+        except urllib.error.HTTPError as exc:
+            try:
+                body = json.loads(exc.read().decode("utf-8"))
+                message = body.get("error") if isinstance(body, dict) else None
+            except Exception:
+                message = None
+            return None, str(message or f"HTTP {exc.code}")
+        except Exception as exc:
+            return None, str(exc)
 
     def status(self):
         running = self.is_running()

@@ -10,16 +10,22 @@
 
 ## 功能
 
-- **批量拉取**：自动发现某组织（默认 `TacVerse`）下全部数据集，增量同步到按日期归档的 `pulls/<YYMMDD>/`，并生成聚合报告。
+- **批量拉取**：自动发现某组织（默认 `TacVerse`）下全部数据集，统一同步到 `datasets/<组织名>/`，并生成聚合报告。
 - **仅统计**（快）：只读取每个数据集的 `meta/info.json`（不下载数据文件），秒级获得 episodes / frames / 时长等统计。
+- **手动补录统计**：从其他电脑或截图补录某一天的数据集数、episodes、frames、总小时数，参与 KPI、趋势和每日新增计算。
 - **检查新增**：对比 Hub 与本地的数据集名称，列出新增 / 缺失。
 - **团队看板 GUI**（PySide6），页签：
   - **看板**：KPI 卡片（数据集总数 / 总小时 / 总 episodes / 今日新增小时 / 今日新增 episodes / 目标完成度 / **今日 MVP ⭐**）+ 可排序筛选的数据集表格（含 **均时长(s)** 质量指标、robot_type、任务数、HF ID、上传者中文名、最后更新、今日新增）。表格默认按 HF「最近更新」排序，和网页一致。
   - **趋势**：每日新增小时（柱，仅显示实际拉取过的日期，不留空白）+ 累计小时（折线）。
   - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并以 Hugging Face `last_modified` 归日、优先使用 commit history 差分、缺失时用本地快照兜底展示单组单日新增总时长。
   - **数据集编辑**：左侧是与看板一致的数据集详情表（选中要操作的数据集）；右侧两组功能——① **改名 / 改 Prompt**（本地 pyarrow 生成新副本，可推送回 Hub）；② 调用 lerobot 官方 `dataset_tools` 的 **删除 episodes / 拆分 / 合并 / 增加特征 / 删除特征**。详见下方[「数据集编辑」](#数据集编辑生成新副本不改动原数据)。
-  - **Viewer**：内嵌 `xense_lerobot_viewer`（Next.js），3D 回放 / 语言标注 / 标签编辑。
+  - **Viewer**：内嵌 `xense_lerobot_viewer`（Next.js），3D 回放 / 语言标注 / 标签编辑；Viewer 数据根固定为 `datasets/<组织名>/`，可直接发现该组织目录下的全部本地数据集。
+  - **Episode 时长定位**：选中已下载的数据集后，检查面板中的 `STATISTICS` 会按时长区间列出 episode 数量；展开区间即可查看具体 `ep`、实际秒数和 frames，用于快速定位过短或过长的数据。
+  - **检查面板布局**：左侧依次显示 `ANNOTATIONS`、`FILTERING`、`ACTION INSIGHTS`，右侧显示 `STATISTICS` 和 `检查规则`；统计概要默认折叠，Episode 时长明细优先显示。
 - **质量检查**：命名规范、均时长（20~600s）、Prompt 词数（10~50 词）等规则内置，看板表格用 ✅/⚠️/❌ 标注；阈值在 `config.json` 的 `checks` 段可调。
+- **PICO MoTracker 轨迹检查**：在右侧「检查规则」中点击按钮后，针对当前已下载数据集按固定阈值扫描 `left_tcp` / `right_tcp` 的相邻帧；同时检查单轴位移和 XYZ 三维位移，并按 Episode 展示帧号、时间、变化量和命中的阈值。该扫描不会随切换数据集自动启动。
+- **Viewer Doctor 诊断**：右侧「数据集检查分区」可切换到 Doctor 页面，调用 vendored viewer 的 TypeScript 诊断接口；支持前 N 个、全部或自定义 Episode 范围，流式显示进度，按 PASS/WARN/FAIL 展开检查结果，并可导出 JSON 报告。Doctor 与 Workbench 的 PICO 固定阈值检查相互独立。
+- **双行功能工具栏**：顶部操作按职责分为两行。第一行集中 `数据源 / 数据获取 / 数据维护`，提供组织选择、刷新统计、下载选中、同步全部、检查新增、手动补录和数据目录；第二行集中 `账号 / Viewer / 目标`，显示登录状态、Viewer 服务控制、打开选中数据集、每日小时目标和当前时间。完整操作说明可通过按钮 tooltip 查看。
 - **登录状态指示器**：顶栏实时显示「已登录: xxx · 可见 N 个数据集」，一眼判断 token 权限是否正确（私有库需要有权限的账号才可见）。
 - **切换账号**：顶栏按钮，运行时粘贴新的 HF token 即可切换（仅本次运行有效，不落盘）。
 
@@ -109,6 +115,7 @@ python -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVer
 python download_dataset.py                                # 拉取默认组织全部数据集
 python download_dataset.py --org <ORG>                    # 指定组织
 python download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
+python download_dataset.py --out-dir datasets/<ORG>       # 指定组织级本地目录
 ```
 
 ### 图形界面（团队看板）
@@ -119,9 +126,87 @@ python main_app.py
 
 进去后：点 **「仅拉取统计信息」**（快，只读信息，不下载）、**「下载当前选中数据集」**（只下选中的一个，省时）或 **「拉取组织及其下所有数据集」**（全量下载 + 累积历史，较慢）。
 
+新版顶部工具栏使用更短的按钮名称，对应关系如下：
+
+| 按钮 | 功能 |
+|---|---|
+| `刷新统计` | 只获取数据集元信息，不下载 Parquet 和视频 |
+| `下载选中` | 下载表格中当前选中的一个数据集 |
+| `同步全部` | 下载当前组织下全部数据集并更新统计历史 |
+| `检查新增` | 对比 Hub 与本地统计记录中的数据集名称 |
+| `手动补录` | 补录指定日期的累计统计快照 |
+| `数据目录` | 打开本地 `datasets/<组织名>/` 目录 |
+| `打开选中` | 在 Viewer 中打开当前选中的本地数据集 |
+
+下载后的本地数据集统一存放在：
+
+```text
+datasets/<组织名>/<数据集名>/
+```
+
+不再按日期创建中间目录。这样 Viewer、任务/语言标注读取和数据集编辑都使用同一个组织级路径；统计历史中的日期仍保留在 `dataset_log.json`，仅用于趋势和每日新增计算。
+
+### Episode 时长定位
+
+Workbench 不显示直方图，而是直接提供可展开的时长分组：
+
+```text
+时长区间          数量
+▼ 200.0–225.0s    22
+    ep 166         201.3s    6039 frames
+    ep 171         204.7s    6141 frames
+    ep 172         211.2s    6336 frames
+
+▶ 225.0–250.0s    27
+▶ 250.0–275.0s    26
+```
+
+该信息来自本地 `meta/episodes` 元数据，按 viewer 相同的分组规则计算。此功能目前针对已下载的 LeRobot v3 数据集；仅统计、未下载或缺少 episode 元数据时，界面会显示原因。
+
+### PICO MoTracker 轨迹检查
+
+选中一个已下载的数据集，在右侧「检查规则」中点击 **检查 PICO MoTracker 轨迹**。结果按以下层级展开：
+
+```text
+❌ PICO MoTracker 轨迹：5 个异常事件，2 个 Episode
+  Episode 0（3 个事件）
+    right_tcp · frame 3752→3753 · 125.067–125.100s · x Δ-1.339，XYZ 1.502
+```
+
+当前只启用固定阈值的两项标准：
+
+- 单轴单帧跳变：`abs(Δx)`、`abs(Δy)` 或 `abs(Δz)` 达到对应阈值；
+- XYZ 三维跳变：`sqrt(Δx² + Δy² + Δz²)` 达到三维阈值。
+
+阈值位于 `config.json` 的 `checks.pico_motracker`：
+
+```json
+"pico_motracker": {
+  "source": "observation.state",
+  "hands": ["left", "right"],
+  "axis_step_threshold": {"x": 0.2, "y": 0.2, "z": 0.2},
+  "xyz_step_threshold": 0.35
+}
+```
+
+修改配置后重启 Workbench；当前版本暂不提供图形化阈值设置窗口，也不包含自适应阈值、恢复形态或加速度标准。
+
+### Viewer Doctor 诊断
+
+选中一个已下载的数据集，在右侧「数据集检查分区」顶部切换到 **Doctor**，然后选择检查范围并点击 **运行 Doctor**：
+
+```text
+数据检查 | Doctor
+检查范围: [前 25 个 Episode]  [运行 Doctor]
+进度: Running Action Quality... 65%
+PASS 8   WARN 2   FAIL 1
+```
+
+Doctor 由 `third_party/lerobot_viewer` 提供，Workbench 通过 viewer 的 HTTP 接口调用，不修改 viewer 源码。诊断包括元数据、时间一致性、动作质量、视频完整性、数据分布、Episode 健康度、特征一致性、训练准备度、异常检测、可移植性和逐 Episode 汇总等项目。全量诊断可能需要更多时间和内存，建议先使用前 25 或自定义范围。
+
 ### 数据集编辑（生成新副本，不改动原数据）
 
-在 **「数据集编辑」** 页签，左表选中一个**已下载**的数据集（未下载的行不能编辑；可先用「下载当前选中数据集」拉下来）。所有操作都**输出为新副本**到 `pulls/<今天>/<输出名>/`，**不会改动原数据集**。
+在 **「数据集编辑」** 页签，左表选中一个**已下载**的数据集（未下载的行不能编辑；可先用「下载当前选中数据集」拉下来）。所有操作都**输出为新副本**到 `datasets/<组织名>/<输出名>/`，**不会改动原数据集**。
 
 **① 改名 / 改 Prompt（本地实现，无需 lerobot）**
 - 直接编辑该数据集的 Prompt（`meta/tasks.parquet` 里的任务指令）和/或输出名，点 **「生成新副本」**。
@@ -145,15 +230,19 @@ python main_app.py
 
 ## 配置与数据文件
 
-- **`config.json`**（核心配置，随仓库提交）：
+- **`config.json`**（手工维护的配置，随仓库提交）：
   - `uploader_names`：**你手工维护**的 `HF ID -> 中文名` 映射。新增成员在这里加一行 `"hf_id": "中文名"`（改完重启 GUI 生效）；查不到的 ID 在界面显示为 `未知`。
+- **`dataset_log.json`**（统计历史，随仓库提交）：
+  - 每次“仅拉取统计信息”或完整拉取后更新，用于恢复 KPI、每日新增和趋势；同一组织每天只保留时间最新的一次结果，后拉取的数据会覆盖当天早先记录。因此**克隆仓库的人不需要 `datasets/` 也能看到历史趋势**。
+  - 顶部“手动补录统计”可写入指定日期的四项累计总量。同一组织和日期再次录入会覆盖旧的手动值；同日后续真实统计会替代手动快照。
+  - 手动快照不包含逐数据集信息，因此作为最新记录时不会显示数据集表格、分组统计或 MVP；“今日新增”由它与前一个有记录日期的累计值相减得到。
 - **`pull_history.local.json`**（本地运行历史，已被 git 忽略）：
-  - 程序每次拉取 / 统计会自动追加精简历史快照，作为每日新增 / 趋势的数据源。
-  - 该文件只保存在本机，不提交到仓库，避免泄露或误同步数据集统计历史。
-- **`hf_change_history.local.json`**（本地 HF 变更历史，已被 git 忽略）：
-  - 程序统计 Hugging Face commit history 中 `meta/info.json` 的差分，作为今日新增 / MVP / 单组单日新增的优先数值来源；缺失项才使用本地快照辅助兜底。
-  - 该文件只保存在本机，不提交到仓库，避免同步提交历史统计细节。
-- **`pulls/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积。
+  - 兼容旧版的本地快照历史文件；新版本优先使用 `dataset_log.json`。
+  - 该文件只保存在本机，不提交到仓库。
+- **`hf_change_history.local.json`**（本地 HF 变更缓存，已被 git 忽略）：
+  - 程序以 Hugging Face `last_modified` 归日，优先使用 commit history 中 `meta/info.json` 的差分计算今日新增、MVP 和单组单日新增；缺失时使用本地快照兜底。
+  - 该缓存只保存在本机，不提交到仓库。
+- **`datasets/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积；组织目录下不再按日期分层。
 
 ---
 
@@ -162,8 +251,10 @@ python main_app.py
 - `main_app.py` —— PySide6 团队看板（GUI 入口）。
 - `download_dataset.py` —— 拉取 / 统计 / 分析 / 配置读写的核心逻辑（CLI 与 GUI 共用）。
 - `checks.py` —— 数据集质量检查插件注册表（命名 / 均时长 / Prompt 等规则）。
+- `pico_motracker.py` —— Qt-free PICO MoTracker 固定阈值轨迹跳变检测器。
 - `dataset_editor.py` —— 「改名 / 改 Prompt」的本地 pyarrow 实现（Qt-free，不依赖 lerobot）。
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。
 - `config.json` —— 上传者中文名映射 + 质量检查阈值。
 - `pull_history.local.json` —— 本地拉取 / 统计历史（自动生成，git 忽略）。
+- `dataset_log.json` —— 自动统计和手动补录共用的轻量历史快照。
 - `hf_change_history.local.json` —— 本地 Hugging Face 变更历史缓存（自动生成，git 忽略）。

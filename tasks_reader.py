@@ -15,12 +15,12 @@ from pathlib import Path
 TASKS_REL = Path("meta") / "tasks.parquet"
 
 
-def resolve_path(dataset, out_dir="pulls"):
+def resolve_path(dataset, out_dir="datasets/TacVerse"):
     """Locate a dataset's tasks.parquet on disk, or None.
 
     Resolution order:
       1. `dataset["local_dir"]/meta/tasks.parquet` (pulled records).
-      2. newest (by mtime) `pulls/*/<leaf>/meta/tasks.parquet`.
+      2. `datasets/<org>/<leaf>/meta/tasks.parquet`.
     """
     local_dir = (dataset or {}).get("local_dir")
     if local_dir:
@@ -32,9 +32,11 @@ def resolve_path(dataset, out_dir="pulls"):
     leaf = name.split("/")[-1]
     if not leaf:
         return None
-    candidates = [
-        p for p in Path(out_dir).glob(f"*/{leaf}/{TASKS_REL}") if p.is_file()
-    ]
+    direct = Path(out_dir) / leaf / TASKS_REL
+    if direct.is_file():
+        return direct
+    candidates = [p for p in Path(out_dir).glob(f"*/{leaf}/{TASKS_REL}")
+                  if p.is_file()]
     if not candidates:
         return None
     return max(candidates, key=lambda p: p.stat().st_mtime)

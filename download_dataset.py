@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""Pull one or more Hugging Face dataset repos into date-stamped folders.
+"""Pull one or more Hugging Face dataset repos into an organization folder.
 
 Datasets are re-pulled on every run (`snapshot_download` syncs incrementally,
 so newly merged files are fetched and unchanged ones are skipped). Each run
-writes everything under a per-day folder:
+stores each dataset directly under the configured organization folder:
 
-    <out-dir>/<YYMMDD>/<dataset-name>/...             # dataset files
-    <out-dir>/<YYMMDD>/pull_result_<YYMMDD>_<HHMM>.json  # aggregate summary
+    <out-dir>/<dataset-name>/...                       # dataset files
+    <out-dir>/pull_result_<YYMMDD>_<HHMMSS>.json      # aggregate summary
 
 The list of datasets lives in DATASETS and can be overridden with repeated
 `--repo-id` flags. The fields lifted from each dataset's meta/info.json are
@@ -210,11 +210,11 @@ def fetch_uploader(repo_id, token=None):
     }
 
 
-def pull_dataset(repo_id, day_dir, revision, token):
-    """Download one dataset into <day_dir>/<dataset-name> and summarize it."""
+def pull_dataset(repo_id, dataset_dir, revision, token):
+    """Download one dataset into <dataset_dir>/<dataset-name> and summarize it."""
     from huggingface_hub import snapshot_download
 
-    local_dir = Path(day_dir) / repo_id.split("/")[-1]
+    local_dir = Path(dataset_dir) / repo_id.split("/")[-1]
     print(f"Downloading {repo_id} -> {local_dir}")
     path = snapshot_download(
         repo_id=repo_id,
@@ -251,15 +251,15 @@ def build_report(summaries, failures, now, org, requested):
 def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
              log=print, progress=None, write_summary=True,
              meta_map=None, with_uploader=True):
-    """Pull every repo in `repo_ids` into a per-day folder and write a report.
+    """Pull every repo in `repo_ids` into one organization folder and write a report.
 
     `log(msg)` receives human-readable progress lines (same text as the CLI).
     `progress(done, total)` is called before and after each dataset so a UI can
     drive a progress bar. Returns (report_dict, out_path_or_None).
     """
     now = now or dt.datetime.now()
-    day_dir = Path(out_dir) / now.strftime("%y%m%d")
-    day_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = Path(out_dir)
+    dataset_dir.mkdir(parents=True, exist_ok=True)
 
     summaries, failures = [], []
     total = len(repo_ids)
@@ -268,7 +268,7 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
     for i, repo_id in enumerate(repo_ids, 1):
         log(f"[{i}/{total}] {repo_id}")
         try:
-            s = pull_dataset(repo_id, day_dir, revision, token)
+            s = pull_dataset(repo_id, dataset_dir, revision, token)
             _enrich(s, repo_id, meta_map, with_uploader, token)
             summaries.append(s)
         except Exception as exc:  # keep pulling the rest if one fails
@@ -280,14 +280,14 @@ def run_pull(repo_ids, out_dir, org, revision=None, token=None, now=None,
     report = build_report(summaries, failures, now, org, total)
     out_path = None
     if write_summary:
-        out_path = day_dir / f"pull_result_{now.strftime('%y%m%d_%H%M')}.json"
+        out_path = dataset_dir / f"pull_result_{now.strftime('%y%m%d_%H%M%S')}.json"
         out_path.write_text(json.dumps(report, indent=2, ensure_ascii=False) + "\n")
         log(f"Wrote summary -> {out_path}")
     try:
-        history_path = append_history(report)
-        log(f"Updated history -> {history_path}")
+        append_pull(report)  # git-committed change-log; survives datasets/ being ignored
+        log(f"Updated history -> {DATASET_LOG_FILE}")
     except OSError as exc:
-        log(f"WARN: could not update {HISTORY_FILE}: {exc}")
+        log(f"WARN: could not update {DATASET_LOG_FILE}: {exc}")
     return report, out_path
 
 
@@ -328,26 +328,42 @@ def collect_stats(repo_ids, org, token=None, now=None, log=print, progress=None,
 
 
 def find_latest_report(out_dir):
-    """Return the newest pull_result_*.json under out_dir/*/ (or None)."""
-    files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
+    """Return the newest pull_result_*.json directly under an org directory."""
+    files = sorted(Path(out_dir).glob("pull_result_*.json"))
+    if not files:
+        files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
     return files[-1] if files else None
 
 
 # --------------------------------------------------------------------------- #
 # Analytics helpers (pure functions over report dicts — used by the GUI)
 # --------------------------------------------------------------------------- #
-# The git-committed config file stores only hand-edited settings. Pull history is
-# runtime data and stays in a local ignored file to avoid exposing or constantly
-# changing dataset snapshots in commits.
+# Two git-committed json files at the repo root, both travelling with the code so
+# a fresh clone gets the collection trend / 每日新增 WITHOUT syncing the multi-GB
+# datasets/ folder (which is .gitignore'd):
+#
+#   config.json       — hand-edited only:
+#                        { "checks": {...}, "uploader_names": {"<hf_id>": "<中文名>"} }
+#   dataset_log.json  — auto-appended per-DATASET change log (no time-major dupes):
+#     { "dataset_index": [ "<name>", ... ],                     # names stored once
+#       "daily_totals": [ {pulled_at,date,org,total_*,present:[idx],
+#                            source?:"manual"} ],  # 1 row/pull/manual snapshot
+#       "datasets": { "<name>": { <meta>, "changes": [ {date,pulled_at,
+#                                total_*,d_*} ] } } }  # a row ONLY when totals moved
 CONFIG_FILE = str(Path(__file__).parent / "config.json")
-HISTORY_FILE = str(Path(__file__).parent / "pull_history.local.json")
+DATASET_LOG_FILE = str(Path(__file__).parent / "dataset_log.json")
 CHANGE_HISTORY_FILE = str(Path(__file__).parent / "hf_change_history.local.json")
+LEGACY_HISTORY_FILE = str(Path(__file__).parent / "pull_history.local.json")
 
-# Per-dataset fields kept in the lightweight history (drop link/local_dir paths).
+# Per-dataset fields exposed to the GUI in a reconstructed snapshot row.
 _HISTORY_DS_FIELDS = (
     "dataset_name", "total_episodes", "total_frames", "duration_hours",
     "fps", "robot_type", "total_tasks", "uploader", "last_modified",
 )
+# Slow-changing metadata stored once per dataset (latest value wins).
+_DS_META_FIELDS = ("fps", "robot_type", "total_tasks", "uploader", "last_modified")
+# Cumulative totals whose movement triggers a new `changes` entry.
+_DS_TOTAL_FIELDS = ("total_episodes", "total_frames", "duration_hours")
 
 
 def _load_json(path):
@@ -369,34 +385,210 @@ def load_uploader_names(path=CONFIG_FILE):
     return load_config(path).get("uploader_names", {}) or {}
 
 
-def _trim_report(report):
-    """A compact, path-free copy of a report for the local history file."""
-    return {
-        "pulled_at": report.get("pulled_at"),
+# --------------------------------------------------------------------------- #
+# Dataset change-log (dataset_log.json) — read / append / reconstruct
+# --------------------------------------------------------------------------- #
+def load_dataset_log(path=DATASET_LOG_FILE):
+    """Read the dataset change-log; returns an empty skeleton on missing/corrupt."""
+    try:
+        log = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        log = None
+    if not isinstance(log, dict):
+        log = {}
+    log.setdefault("dataset_index", [])
+    log.setdefault("daily_totals", [])
+    log.setdefault("datasets", {})
+    return log
+
+
+def _dataset_log_text(log, present_per_line=16):
+    """Serialize the change-log in a compact but still reviewable layout.
+
+    Normal ``json.dumps(..., indent=2)`` places every integer on its own line,
+    and expands every small dataset/change object across many lines.  Keep the
+    top-level collections readable, group ``present`` indices, render each
+    change object on one line, and render each dataset's metadata on one line.
+    The result remains plain JSON and round-trips through any standard parser.
+    """
+    def compact(value):
+        return json.dumps(value, ensure_ascii=False, separators=(", ", ": "))
+
+    def append_regular_property(lines, key, value, trailing_comma):
+        dumped = json.dumps(value, indent=2, ensure_ascii=False).splitlines()
+        key_text = json.dumps(key, ensure_ascii=False)
+        if len(dumped) == 1:
+            lines.append(f"  {key_text}: {dumped[0]}" + ("," if trailing_comma else ""))
+            return
+        lines.append(f"  {key_text}: {dumped[0]}")
+        lines.extend("  " + line for line in dumped[1:-1])
+        lines.append("  " + dumped[-1] + ("," if trailing_comma else ""))
+
+    def append_datasets(lines, datasets, trailing_comma):
+        lines.append('  "datasets": {')
+        items = list(datasets.items())
+        for dataset_i, (name, section) in enumerate(items):
+            dataset_comma = dataset_i < len(items) - 1
+            lines.append(f"    {json.dumps(name, ensure_ascii=False)}: {{")
+            changes = section.get("changes", []) or []
+            metadata = [(key, value) for key, value in section.items()
+                        if key != "changes"]
+            if changes:
+                lines.append('      "changes": [')
+                for change_i, change in enumerate(changes):
+                    if change_i < len(changes) - 1:
+                        suffix = ","
+                    else:
+                        suffix = "]" + ("," if metadata else "")
+                    lines.append("        " + compact(change) + suffix)
+            else:
+                lines.append('      "changes": []' + ("," if metadata else ""))
+
+            if metadata:
+                meta_text = ", ".join(
+                    f"{json.dumps(key, ensure_ascii=False)}: {compact(value)}"
+                    for key, value in metadata)
+                lines.append("      " + meta_text + "}" + ("," if dataset_comma else ""))
+            else:
+                lines.append("    }" + ("," if dataset_comma else ""))
+        lines.append("  }" + ("," if trailing_comma else ""))
+
+    lines = ["{"]
+    properties = list(log.items())
+    for prop_i, (key, value) in enumerate(properties):
+        trailing_comma = prop_i < len(properties) - 1
+        if key == "datasets" and isinstance(value, dict):
+            append_datasets(lines, value, trailing_comma)
+        else:
+            append_regular_property(lines, key, value, trailing_comma)
+    lines.append("}")
+
+    # Compact only the already-rendered multi-line present arrays; empty arrays
+    # stay as ``[]`` and all other arrays retain their dedicated layouts above.
+    out = []
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if line.strip() != '"present": [':
+            out.append(line)
+            i += 1
+            continue
+
+        values = []
+        j = i + 1
+        while j < len(lines) and lines[j].strip() not in ("]", "],"):
+            values.append(lines[j].strip().rstrip(","))
+            j += 1
+        if not values or j >= len(lines):
+            out.append(line)
+            i += 1
+            continue
+
+        out.append(line)
+        value_indent = line[:len(line) - len(line.lstrip())] + "  "
+        for start in range(0, len(values), present_per_line):
+            chunk = values[start:start + present_per_line]
+            suffix = "," if start + present_per_line < len(values) else ""
+            out.append(value_indent + ", ".join(chunk) + suffix)
+        out.append(lines[j])
+        i = j + 1
+    return "\n".join(out) + "\n"
+
+
+def write_dataset_log(log, path=DATASET_LOG_FILE):
+    """Write ``log`` using the repository's readable compact JSON format."""
+    Path(path).write_text(_dataset_log_text(log), encoding="utf-8")
+    return path
+
+
+def _fold_report_into_log(log, report):
+    """Merge one report into `log` in place. Appends the per-pull aggregate row
+    and, per dataset, a change entry ONLY when its totals moved — recording both
+    the resulting totals and the +delta vs the previous entry.
+
+    Dataset names are stored once in the shared `dataset_index`; each daily_totals
+    row lists the datasets present at that pull as integer indices into it
+    (`present`), so names aren't re-listed in full on every pull. Reports must be
+    folded oldest-first so deltas chain correctly."""
+    at = report.get("pulled_at")
+    date = report.get("date")
+    org = report.get("org")
+    totals = log.setdefault("daily_totals", [])
+
+    # One authoritative snapshot per organisation and calendar day.  Ignore an
+    # out-of-order older report instead of allowing it to replace newer data.
+    same_day = [t for t in totals
+                if t.get("date") == date and t.get("org") == org]
+    if same_day and max((t.get("pulled_at") or "") for t in same_day) > (at or ""):
+        return log
+
+    # Remove the earlier aggregate row and its per-dataset changes before
+    # calculating this pull's deltas.  The remaining previous change is then
+    # from an earlier day, so d_* represents the whole day's growth.
+    totals[:] = [t for t in totals
+                 if not (t.get("date") == date and t.get("org") == org)]
+    report_names = {d.get("dataset_name") for d in report.get("datasets", [])
+                    if d.get("dataset_name")}
+    prefix = f"{org}/" if org else None
+    for name, sect in log.setdefault("datasets", {}).items():
+        if name not in report_names and not (prefix and name.startswith(prefix)):
+            continue
+        changes = sect.setdefault("changes", [])
+        changes[:] = [c for c in changes if c.get("date") != date]
+
+    index = log.setdefault("dataset_index", [])
+    pos = {n: i for i, n in enumerate(index)}
+    dsets = log.setdefault("datasets", {})
+
+    present = []
+    for d in report.get("datasets", []):
+        name = d.get("dataset_name")
+        if not name:
+            continue
+        if name not in pos:                    # register the name once
+            pos[name] = len(index)
+            index.append(name)
+        present.append(pos[name])              # present even if unchanged below
+        sect = dsets.setdefault(name, {"changes": []})
+        for k in _DS_META_FIELDS:              # keep newest slow-changing metadata
+            sect[k] = d.get(k)
+        changes = sect.setdefault("changes", [])
+        changes[:] = [c for c in changes if c.get("pulled_at") != at]  # idempotent
+        cur = {k: d.get(k) for k in _DS_TOTAL_FIELDS}
+        prev = changes[-1] if changes else None
+        if prev and all(prev.get(k) == cur.get(k) for k in _DS_TOTAL_FIELDS):
+            continue                            # unchanged -> write no change row
+        base = prev or {}
+        changes.append({
+            "date": report.get("date"), "pulled_at": at, **cur,
+            "d_episodes": (cur.get("total_episodes") or 0) - (base.get("total_episodes") or 0),
+            "d_frames": (cur.get("total_frames") or 0) - (base.get("total_frames") or 0),
+            "d_hours": round((cur.get("duration_hours") or 0) - (base.get("duration_hours") or 0), 3),
+        })
+
+    row = {
+        "pulled_at": at,
         "date": report.get("date"),
         "org": report.get("org"),
         "total_datasets": report.get("total_datasets"),
         "total_episodes": report.get("total_episodes"),
         "total_frames": report.get("total_frames"),
         "total_hours": report.get("total_hours"),
-        "datasets": [{k: d.get(k) for k in _HISTORY_DS_FIELDS}
-                     for d in report.get("datasets", [])],
+        "present": sorted(present),
     }
-
-
-def load_history_file(path=HISTORY_FILE):
-    """Read local history; accepts the current list format and old dict format."""
-    data = _load_json(path)
-    if isinstance(data, list):
-        return data
-    if isinstance(data, dict):
-        return data.get("pull_history", []) or []
-    return []
+    if report.get("source"):
+        row["source"] = report["source"]
+    totals.append(row)
+    totals.sort(key=lambda t: t.get("pulled_at") or "")
+    return log
 
 
 def load_hf_change_history(path=CHANGE_HISTORY_FILE):
     """Read local Hugging Face commit-diff history cache."""
-    data = _load_json(path)
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        data = None
     if isinstance(data, dict):
         data.setdefault("version", 1)
         data.setdefault("repos", {})
@@ -405,44 +597,213 @@ def load_hf_change_history(path=CHANGE_HISTORY_FILE):
 
 
 def save_hf_change_history(data, path=CHANGE_HISTORY_FILE):
-    Path(path).write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n")
+    Path(path).write_text(
+        json.dumps(data, indent=2, ensure_ascii=False) + "\n",
+        encoding="utf-8")
     return path
 
 
-def append_history(report, path=HISTORY_FILE, legacy_config_file=CONFIG_FILE):
-    """Fold a trimmed snapshot of `report` into the local history file.
+def _legacy_history_rows(path=LEGACY_HISTORY_FILE):
+    """Load the old local pull history file when it still exists."""
+    data = _load_json(path)
+    if isinstance(data, list):
+        return data
+    if isinstance(data, dict):
+        return data.get("pull_history", []) or []
+    return []
 
-    If the local file does not exist yet, seed it from the old config
-    `pull_history` field for one-time backward compatibility.
+
+def append_pull(report, path=DATASET_LOG_FILE):
+    """Fold `report` into the git-committed dataset change-log at `path`.
+
+    Unchanged datasets are not re-stored on every pull, so the file stays small.
+    Re-reads first; safe to re-run. Returns the path written.
     """
-    hist = load_history_file(path)
-    if not hist and not Path(path).exists():
-        hist = load_config(legacy_config_file).get("pull_history", []) or []
-    snap = _trim_report(report)
-    hist = [h for h in hist if h.get("pulled_at") != snap.get("pulled_at")]
-    hist.append(snap)
-    hist.sort(key=lambda r: r.get("pulled_at") or "")
-    Path(path).write_text(json.dumps(hist, indent=2, ensure_ascii=False) + "\n")
-    return path
+    log = load_dataset_log(path)
+    # A real stats/pull on the same day supersedes an aggregate-only manual
+    # placeholder.  This prevents the synthetic 23:59:59 manual timestamp from
+    # continuing to win after fresh detailed data becomes available.
+    totals = log.setdefault("daily_totals", [])
+    totals[:] = [t for t in totals if not (
+        t.get("source") == "manual"
+        and t.get("date") == report.get("date")
+        and t.get("org") == report.get("org")
+    )]
+    _fold_report_into_log(log, report)
+    return write_dataset_log(log, path)
 
 
-def load_history(out_dir, history_file=HISTORY_FILE, config_file=CONFIG_FILE):
+def upsert_manual_totals(date, org, total_datasets, total_episodes,
+                         total_frames, total_hours, path=DATASET_LOG_FILE,
+                         today=None):
+    """Insert or replace one aggregate-only manual snapshot.
+
+    ``date`` uses the same YYMMDD format as regular reports.  The synthetic
+    end-of-day timestamp makes the manual snapshot authoritative for that day;
+    :func:`append_pull` removes it if real detailed statistics are later pulled
+    for the same organisation and date.
+    """
+    try:
+        day = dt.datetime.strptime(date, "%y%m%d").date()
+    except (TypeError, ValueError) as exc:
+        raise ValueError("date must use YYMMDD format") from exc
+    today = today or dt.date.today()
+    if day > today:
+        raise ValueError("manual snapshot date cannot be in the future")
+    if not isinstance(org, str) or not org.strip():
+        raise ValueError("org cannot be empty")
+
+    integer_fields = {
+        "total_datasets": total_datasets,
+        "total_episodes": total_episodes,
+        "total_frames": total_frames,
+    }
+    normalized = {}
+    for key, value in integer_fields.items():
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{key} must be a non-negative integer")
+        normalized[key] = value
+    if isinstance(total_hours, bool) or not isinstance(total_hours, (int, float)) \
+            or total_hours < 0:
+        raise ValueError("total_hours must be a non-negative number")
+
+    report = {
+        "pulled_at": day.strftime("%Y-%m-%dT23:59:59"),
+        "date": date,
+        "org": org.strip(),
+        **normalized,
+        "total_hours": round(float(total_hours), 3),
+        "datasets": [],
+        "source": "manual",
+    }
+    log = load_dataset_log(path)
+    totals = log.setdefault("daily_totals", [])
+    totals[:] = [t for t in totals if not (
+        t.get("source") == "manual"
+        and t.get("date") == date
+        and t.get("org") == report["org"]
+    )]
+    _fold_report_into_log(log, report)
+    write_dataset_log(log, path)
+    return report
+
+
+def _state_as_of(log, pulled_at, names):
+    """Per-dataset snapshot rows for `names` as they stood at `pulled_at`.
+
+    For each name, take the last change entry with pulled_at <= the target and
+    merge in the dataset's metadata, rebuilding a row shaped like the old
+    pull_history datasets[] entries (_HISTORY_DS_FIELDS)."""
+    dsets = log.get("datasets", {})
+    target = pulled_at or ""
+    rows = []
+    for name in names:
+        sect = dsets.get(name)
+        if not sect:
+            continue
+        latest = None
+        for c in sect.get("changes", []):
+            if (c.get("pulled_at") or "") <= target:
+                latest = c
+        if latest is None:
+            continue
+        row = {"dataset_name": name}
+        for k in _DS_TOTAL_FIELDS:
+            row[k] = latest.get(k)
+        for k in _DS_META_FIELDS:
+            row[k] = sect.get(k)
+        rows.append(row)
+    return rows
+
+
+def _reconstruct_history(log):
+    """Rebuild the oldest-first list of full pull snapshots from the change-log,
+    equivalent to the old config['pull_history'] shape so downstream analytics
+    (daily_series / find_baseline / compute_deltas) need no changes."""
+    index = log.get("dataset_index", [])
+    snaps = []
+    for row in sorted(log.get("daily_totals", []),
+                      key=lambda t: t.get("pulled_at") or ""):
+        names = [index[i] for i in row.get("present", []) if 0 <= i < len(index)]
+        snap = {k: row.get(k) for k in
+                ("pulled_at", "date", "org", "total_datasets",
+                 "total_episodes", "total_frames", "total_hours")}
+        if row.get("source"):
+            snap["source"] = row["source"]
+        snap["datasets"] = _state_as_of(log, row.get("pulled_at"), names)
+        snaps.append(snap)
+    return snaps
+
+
+def compact_dataset_log(path=DATASET_LOG_FILE):
+    """Rewrite an existing log with only its latest rows per calendar day.
+
+    The cleanup is deliberately in-place: dataset metadata and orphaned index
+    entries are retained, while aggregate rows and each dataset's change rows
+    are collapsed independently.  Deltas are then recomputed against the prior
+    retained day.
+    """
+    log = load_dataset_log(path)
+    before = len(log.get("daily_totals", []))
+    latest = {}
+    for row in log.get("daily_totals", []):
+        key = (row.get("date") or row.get("pulled_at"), row.get("org"))
+        previous = latest.get(key)
+        if previous is None or (row.get("pulled_at") or "") \
+                >= (previous.get("pulled_at") or ""):
+            latest[key] = row
+    log["daily_totals"] = sorted(
+        latest.values(), key=lambda r: r.get("pulled_at") or "")
+
+    for sect in log.get("datasets", {}).values():
+        by_day = {}
+        for change in sect.get("changes", []):
+            key = change.get("date") or change.get("pulled_at")
+            previous = by_day.get(key)
+            if previous is None or (change.get("pulled_at") or "") \
+                    >= (previous.get("pulled_at") or ""):
+                by_day[key] = change
+        changes = sorted(by_day.values(), key=lambda c: c.get("pulled_at") or "")
+        previous = None
+        for change in changes:
+            base = previous or {}
+            change["d_episodes"] = ((change.get("total_episodes") or 0)
+                                     - (base.get("total_episodes") or 0))
+            change["d_frames"] = ((change.get("total_frames") or 0)
+                                   - (base.get("total_frames") or 0))
+            change["d_hours"] = round(
+                (change.get("duration_hours") or 0)
+                - (base.get("duration_hours") or 0), 3)
+            previous = change
+        sect["changes"] = changes
+
+    write_dataset_log(log, path)
+    return before, len(log["daily_totals"])
+
+
+def load_history(out_dir, log_file=DATASET_LOG_FILE, org=None):
     """Load pull snapshots oldest-first for trends / deltas.
 
-    Merges the local history file, any legacy config["pull_history"], and any
-    pulls/*/pull_result_*.json still on disk, deduping by pulled_at.
+    Reconstructs the committed snapshots from the dataset change-log and merges
+    them with any local pull_result_*.json still on disk, deduping by
+    pulled_at so both sources contribute but neither double-counts.
     """
     by_at = {}
-    for r in load_config(config_file).get("pull_history", []) or []:
-        by_at[r.get("pulled_at") or id(r)] = r
-    for r in load_history_file(history_file):
-        by_at[r.get("pulled_at") or id(r)] = r
-    for f in sorted(Path(out_dir).glob("*/pull_result_*.json")):
+    for r in _reconstruct_history(load_dataset_log(log_file)):
+        if org is not None and r.get("org") != org:
+            continue
+        key = (r.get("pulled_at") or id(r), r.get("org"))
+        by_at[key] = r
+    files = sorted(Path(out_dir).glob("pull_result_*.json"))
+    if not files:
+        files = sorted(Path(out_dir).glob("*/pull_result_*.json"))
+    for f in files:
         try:
             r = json.loads(f.read_text())
         except (OSError, ValueError):
             continue
-        by_at.setdefault(r.get("pulled_at") or str(f), r)  # history file wins on ties
+        key = (r.get("pulled_at") or str(f), r.get("org"))
+        by_at.setdefault(key, r)  # log wins on ties
     history = list(by_at.values())
     history.sort(key=lambda r: r.get("pulled_at", ""))
     return history
@@ -451,8 +812,8 @@ def load_history(out_dir, history_file=HISTORY_FILE, config_file=CONFIG_FILE):
 def load_latest_local_report(out_dir, org=ORG):
     """Return the newest locally available report without network access.
 
-    Priority: explicit pulls/*/pull_result_*.json, then local history, then a
-    best-effort scan of downloaded pulls/*/<dataset>/meta/info.json directories.
+    Priority: explicit pull_result JSON, then the committed dataset log, then a
+    best-effort scan of downloaded <dataset>/meta/info.json directories.
     """
     latest = find_latest_report(out_dir)
     if latest:
@@ -460,26 +821,112 @@ def load_latest_local_report(out_dir, org=ORG):
         if isinstance(data, dict) and data.get("datasets"):
             return data, str(latest)
 
-    history = load_history(out_dir)
+    history = load_history(out_dir, org=org)
     if history:
         report = history[-1]
         if isinstance(report, dict) and report.get("datasets"):
-            return report, HISTORY_FILE
+            return report, DATASET_LOG_FILE
 
     summaries = []
-    newest_by_leaf = {}
-    for info in Path(out_dir).glob("*/*/meta/info.json"):
+    for info in sorted(Path(out_dir).glob("*/meta/info.json")):
         dataset_dir = info.parent.parent
-        prev = newest_by_leaf.get(dataset_dir.name)
-        if prev is None or dataset_dir.stat().st_mtime > prev.stat().st_mtime:
-            newest_by_leaf[dataset_dir.name] = dataset_dir
-    for leaf, dataset_dir in sorted(newest_by_leaf.items()):
-        summaries.append(build_summary(f"{org}/{leaf}", str(dataset_dir)))
+        summaries.append(build_summary(f"{org}/{dataset_dir.name}", str(dataset_dir)))
     if summaries:
         latest_time = max((Path(s["local_dir"]).stat().st_mtime for s in summaries), default=None)
         now = dt.datetime.fromtimestamp(latest_time) if latest_time else dt.datetime.now()
         return build_report(summaries, [], now, org, len(summaries)), str(Path(out_dir))
     return None, None
+
+
+def migrate_pull_history_to_log(config_path=CONFIG_FILE, log_path=DATASET_LOG_FILE,
+                                legacy_history_path=LEGACY_HISTORY_FILE):
+    """Merge legacy pull-history sources into the committed dataset log.
+
+    Supports the old config["pull_history"] field and the old local
+    pull_history.local.json file. New pulls only write dataset_log.json.
+    """
+    cfg = load_config(config_path)
+    legacy = list(cfg.get("pull_history", []) or [])
+    legacy.extend(_legacy_history_rows(legacy_history_path))
+    existing_log = load_dataset_log(log_path)
+    existing = _reconstruct_history(existing_log)
+
+    if not legacy and not existing_log.get("daily_totals"):
+        cfg.pop("pull_history", None)
+        Path(config_path).write_text(
+            json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+        return log_path
+
+    latest_log_rows = {}
+    for row in existing_log.get("daily_totals", []):
+        key = (row.get("date"), row.get("org"))
+        previous = latest_log_rows.get(key)
+        if previous is None or (row.get("pulled_at") or "") \
+                >= (previous.get("pulled_at") or ""):
+            latest_log_rows[key] = row
+    latest_legacy_rows = {}
+    for row in legacy:
+        key = (row.get("date"), row.get("org"))
+        previous = latest_legacy_rows.get(key)
+        row_rank = (
+            row.get("source") != "manual" and bool(row.get("datasets")),
+            row.get("pulled_at") or "",
+        )
+        previous_rank = (
+            previous.get("source") != "manual" and bool(previous.get("datasets")),
+            previous.get("pulled_at") or "",
+        ) if previous else (False, "")
+        if previous is None or row_rank >= previous_rank:
+            latest_legacy_rows[key] = row
+
+    covered = True
+    for key, legacy_row in latest_legacy_rows.items():
+        log_row = latest_log_rows.get(key)
+        legacy_is_detailed = (
+            legacy_row.get("source") != "manual"
+            and bool(legacy_row.get("datasets"))
+        )
+        if log_row is None or (legacy_is_detailed and log_row.get("source") == "manual") \
+                or (log_row.get("pulled_at") or "") < (legacy_row.get("pulled_at") or ""):
+            covered = False
+            break
+
+    if covered:
+        if "pull_history" in cfg:
+            cfg.pop("pull_history", None)
+            Path(config_path).write_text(
+                json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8")
+        return log_path
+
+    by_key = {}
+    for snap in legacy + existing:
+        by_key[(snap.get("pulled_at") or id(snap), snap.get("org"))] = snap
+
+    snapshots = list(by_key.values())
+    detailed_days = {
+        (snap.get("date"), snap.get("org"))
+        for snap in snapshots
+        if snap.get("source") != "manual" and snap.get("datasets")
+    }
+    snapshots = [
+        snap for snap in snapshots
+        if not (snap.get("source") == "manual"
+                and (snap.get("date"), snap.get("org")) in detailed_days)
+    ]
+
+    log = {"dataset_index": [], "daily_totals": [], "datasets": {}}
+    for snap in sorted(snapshots, key=lambda r: r.get("pulled_at") or ""):
+        _fold_report_into_log(log, snap)
+    write_dataset_log(log, log_path)
+
+    if "pull_history" in cfg:
+        cfg.pop("pull_history", None)
+        Path(config_path).write_text(
+            json.dumps(cfg, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8")
+    return log_path
 
 
 def daily_series(history):
@@ -929,6 +1376,19 @@ def _repo_cache_matches(change_history, dataset):
     return bool(repo.get("changes")) and repo.get("last_modified") == dataset.get("last_modified")
 
 
+def hf_report_has_matching_change_cache(current_report, change_history):
+    """Whether a current dataset has a matching cache row for its update day."""
+    for dataset in (current_report or {}).get("datasets", []):
+        if not _repo_cache_matches(change_history, dataset):
+            continue
+        date = _hf_update_date(dataset) or (current_report or {}).get("date")
+        if any(row.get("date") == date
+               for row in _repo_change_rows(
+                   change_history, dataset.get("dataset_name"))):
+            return True
+    return False
+
+
 def hf_last_modified_dataset_deltas(current_report, history, change_history):
     """Per-dataset additions with HF last_modified as the date authority.
 
@@ -947,12 +1407,13 @@ def hf_last_modified_dataset_deltas(current_report, history, change_history):
         name = dataset.get("dataset_name")
         if not name:
             continue
-        date = _hf_update_date(dataset)
-        if not date:
-            continue
+        date = _hf_update_date(dataset) or current_report.get("date") or ""
         if _repo_cache_matches(change_history, dataset):
             rows = [row for row in _repo_change_rows(change_history, name)
                     if row.get("date") == date]
+        else:
+            rows = []
+        if rows:
             hours = round(sum(row.get("hours") or 0 for row in rows), 3)
             episodes = sum(row.get("episodes") or 0 for row in rows)
             frames = sum(row.get("frames") or 0 for row in rows)
@@ -1003,13 +1464,26 @@ def hf_last_modified_daily_group_series(current_report, history, change_history,
 
 def hf_last_modified_latest_date(current_report):
     datasets = (current_report or {}).get("datasets", [])
-    return max((_hf_update_date(dataset) for dataset in datasets if _hf_update_date(dataset)), default="")
+    hf_date = max(
+        (_hf_update_date(dataset) for dataset in datasets if _hf_update_date(dataset)),
+        default="")
+    return hf_date or (current_report or {}).get("date") or ""
 
 
 def hf_last_modified_totals(current_report, history, change_history, date=None):
     date = date or hf_last_modified_latest_date(current_report)
     totals = {"date": date, "hours": 0.0, "episodes": 0, "datasets": 0}
-    if not date:
+    if not current_report or not date:
+        return totals
+    if current_report.get("source") == "manual":
+        totals["hours"], totals["episodes"] = aggregate_deltas(
+            current_report, history)
+        base = find_baseline(current_report, history)
+        totals["datasets"] = max(
+            0,
+            (current_report.get("total_datasets") or 0)
+            - ((base.get("total_datasets") or 0) if base else 0),
+        )
         return totals
     rows = hf_last_modified_daily_group_series(
         current_report, history, change_history, lambda dataset: "__all__")
@@ -1042,12 +1516,25 @@ def find_baseline(current_report, history):
     exists (the current report is the first ever).
     """
     cur_date = current_report.get("date") or ""
+    cur_org = current_report.get("org")
     prior = None
     for r in history:  # oldest-first; last match = newest earlier-day pull
         rd = r.get("date") or ""
+        if cur_org is not None and r.get("org") not in (None, cur_org):
+            continue
         if rd and rd < cur_date:
             prior = r
     return prior
+
+
+def aggregate_deltas(current_report, history):
+    """Return aggregate (new_hours, new_episodes) vs the prior recorded day."""
+    base = find_baseline(current_report, history)
+    base_hours = (base.get("total_hours") or 0) if base else 0
+    base_eps = (base.get("total_episodes") or 0) if base else 0
+    new_hours = round((current_report.get("total_hours") or 0) - base_hours, 2)
+    new_episodes = (current_report.get("total_episodes") or 0) - base_eps
+    return new_hours, new_episodes
 
 
 def compute_deltas(current_report, history):
@@ -1118,7 +1605,7 @@ def rollup(datasets, key_fn):
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Pull HF datasets into date-stamped folders."
+        description="Pull HF datasets into one organization dataset folder."
     )
     parser.add_argument(
         "--org",
@@ -1134,8 +1621,8 @@ def main() -> int:
     )
     parser.add_argument(
         "--out-dir",
-        default="pulls",
-        help="Base directory; a per-day <YYMMDD> subfolder is created inside",
+        default="datasets/TacVerse",
+        help="Organization dataset directory; datasets are stored directly inside",
     )
     parser.add_argument("--revision", default=None, help="Branch, tag, or commit")
     parser.add_argument(
@@ -1148,7 +1635,18 @@ def main() -> int:
         action="store_true",
         help="Download only; skip writing the summary file",
     )
+    parser.add_argument(
+        "--migrate-log",
+        action="store_true",
+        help="One-time: convert config.json's legacy pull_history into "
+             "dataset_log.json and drop pull_history from config.json, then exit",
+    )
     args = parser.parse_args()
+
+    if args.migrate_log:
+        path = migrate_pull_history_to_log()
+        print(f"Migrated pull_history -> {path}; removed pull_history from {CONFIG_FILE}")
+        return 0
 
     normalize_proxy_env()
 
