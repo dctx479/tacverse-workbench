@@ -2609,7 +2609,7 @@ class MainWindow(QWidget):
 
     # ---- Viewer tab (vendored xense_lerobot_viewer, black-box service) ---- #
     def _viewer_root(self):
-        """The flat organization dataset root scanned by the viewer."""
+        """The stable, flat organization dataset root scanned by Viewer."""
         return str(Path(OUT_DIR).resolve())
 
     def _build_viewer_tab(self):
@@ -2711,7 +2711,8 @@ class MainWindow(QWidget):
         extra = f" · 可见数据集 {self._viewer_count}" if self._viewer_count is not None else ""
 
         # Toolbar controls (canonical).
-        self.top_viewer_dot.setText(f'<span style="color:{color}">●</span> Viewer')
+        self.top_viewer_dot.setText(
+            f'<span style="color:{color}">●</span> Viewer: {text} · {st["port"]}')
         detail = st.get("error") or (
             f'数据根: {st.get("actual_root") or st["root"] or self._viewer_root()}')
         self.top_viewer_dot.setToolTip(

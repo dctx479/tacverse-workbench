@@ -44,7 +44,7 @@ INFO_FIELDS = [
 DEFAULT_FPS = 30
 
 # Serialize Workbench snapshot calls so a single pull and a batch pull cannot
-# target the same dated directory at the same time.
+# target the same local dataset directory at the same time.
 _SNAPSHOT_LOCK = threading.RLock()
 
 
@@ -261,7 +261,7 @@ def pull_dataset(repo_id, dataset_dir, revision, token, log=print):
                 log(retry_message)
                 time.sleep(0.25)
             try:
-                path = _snapshot_to_local(
+                _snapshot_to_local(
                     repo_id, revision, local_dir, token,
                     max_workers=workers,
                 )
