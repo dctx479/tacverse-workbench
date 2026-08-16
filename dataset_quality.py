@@ -139,7 +139,7 @@ def _repo_leaf(repo_id):
 
 def _hub_local_dir(local_dir):
     """Return an extended Win32 path for Hub cache files over MAX_PATH."""
-    path = str(Path(local_dir).resolve())
+    path = os.path.abspath(os.fspath(local_dir))
     if os.name != "nt" or path.startswith("\\\\?\\"):
         return path
     if path.startswith("\\\\"):
