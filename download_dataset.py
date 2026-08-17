@@ -44,9 +44,16 @@ INFO_FIELDS = [
 # Assumed capture rate (frames per second) when a dataset's info.json omits fps.
 DEFAULT_FPS = 30
 
-# Serialize Workbench snapshot calls so a single pull and a batch pull cannot
-# target the same local dataset directory at the same time.
-_SNAPSHOT_LOCK = threading.RLock()
+# Serialize snapshot calls per target directory so different datasets can pull
+# concurrently while a single pull and a batch pull cannot write the same dir.
+_SNAPSHOT_LOCKS = {}
+_SNAPSHOT_LOCKS_GUARD = threading.Lock()
+
+
+def _snapshot_lock_for(local_dir):
+    key = os.path.normcase(os.path.abspath(os.fspath(local_dir)))
+    with _SNAPSHOT_LOCKS_GUARD:
+        return _SNAPSHOT_LOCKS.setdefault(key, threading.RLock())
 
 
 _TRANSIENT_NETWORK_MARKERS = (
@@ -335,7 +342,7 @@ def pull_dataset(repo_id, dataset_dir, revision, token, log=print):
     log(f"Downloading {repo_id} -> {local_dir}")
     attempts = [8, 1, 1]
     retry_note = None
-    with _SNAPSHOT_LOCK:
+    with _snapshot_lock_for(local_dir):
         for index, workers in enumerate(attempts):
             if retry_note:
                 log(retry_note)

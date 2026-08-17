@@ -2,11 +2,12 @@ import os
 import sys
 import unittest
 import datetime as dt
+from pathlib import Path
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QItemSelectionModel, Qt
 from PySide6.QtWidgets import QApplication
 
 import main_app
@@ -101,6 +102,111 @@ class MainWindowUiTests(unittest.TestCase):
         self.assertIn("拉取完成: 1/1 个数据集", win.status.text())
         self.assertFalse(win.btn_pull.isEnabled())
         win._set_busy(False)
+
+    def test_download_finished_clears_ui_when_done_signal_is_lost(self):
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        worker = main_app.DownloadOneWorker(
+            "TacVerse/test-dataset", str(Path(main_app.OUT_DIR).parent), None)
+        worker.local_dir = str(Path(main_app.OUT_DIR) / "test-dataset")
+        win._download_workers = [worker]
+        win._download_started = 1
+        win._download_completed = 0
+        win._download_successes = []
+        win._download_failures = []
+        win.speed_label.setText("12.5 MB/s")
+        win.speed_timer.start()
+        win.bar.setMaximum(0)
+        win.status.setText("开始下载 TacVerse/test-dataset ...")
+        win._set_busy(True)
+
+        with patch.object(win, "sender", return_value=worker):
+            win._on_download_worker_finished()
+
+        self.assertEqual("—", win.speed_label.text())
+        self.assertEqual(1, win.bar.maximum())
+        self.assertEqual(1, win.bar.value())
+        self.assertTrue(win.btn_download.isEnabled())
+        self.assertIn("下载完成", win.status.text())
+        if win._download_message_box is not None:
+            win._download_message_box.close()
+
+    def test_stats_and_download_actions_can_run_concurrently(self):
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        win._stats_worker = object()
+        win._download_workers = []
+        win._refresh_action_states()
+        self.assertFalse(win.btn_stats.isEnabled())
+        self.assertTrue(win.btn_download.isEnabled())
+        self.assertFalse(win.btn_pull.isEnabled())
+
+        win._stats_worker = None
+        win._download_workers = [object()]
+        win._refresh_action_states()
+        self.assertTrue(win.btn_stats.isEnabled())
+        self.assertTrue(win.btn_download.isEnabled())
+        self.assertFalse(win.btn_pull.isEnabled())
+        win._stats_worker = None
+        win._download_workers = []
+
+    def test_download_selected_starts_multiple_parallel_workers(self):
+        report = {
+            "date": "260101",
+            "org": "TacVerse",
+            "datasets": [
+                {
+                    "dataset_name": "TacVerse/test-a",
+                    "total_episodes": 1,
+                    "total_frames": 1,
+                    "duration_hours": 0.1,
+                },
+                {
+                    "dataset_name": "TacVerse/test-b",
+                    "total_episodes": 1,
+                    "total_frames": 1,
+                    "duration_hours": 0.1,
+                },
+            ],
+        }
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+        win.report = report
+        win._refresh_table()
+
+        selection = win.table.fixed.selectionModel()
+        selection.clearSelection()
+        for row in (0, 1):
+            index = win.table.fixed.model().index(row, 0)
+            selection.select(
+                index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+        win.table._sync_selection(win.table.fixed)
+        self.assertEqual([0, 1], win.table.selectedRows())
+
+        with patch.object(main_app.DownloadOneWorker, "start"):
+            win.on_download_selected()
+
+        self.assertEqual(2, len(win._download_workers))
+        self.assertEqual(
+            {"TacVerse/test-a", "TacVerse/test-b"},
+            {w.repo_id for w in win._download_workers})
+        for w in win._download_workers:
+            w.deleteLater()
+        win._download_workers = []
 
     def test_trend_axis_labels_are_adaptive(self):
         report = {

@@ -81,6 +81,7 @@ class DatasetLogTests(unittest.TestCase):
             '"total_tasks": 1, "uploader": "WBH333", '
             '"last_modified": "2026-07-02T09:16:55+00:00"}', text)
 
+
     def test_manual_snapshot_upserts_and_real_pull_replaces_it(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "dataset_log.json"
@@ -465,6 +466,16 @@ class DatasetLogTests(unittest.TestCase):
             self.assertEqual(174, history[0]["total_datasets"])
             self.assertEqual(9670, history[0]["total_episodes"])
             self.assertEqual(1, len(history[0]["datasets"]))
+
+
+class SnapshotLockTests(unittest.TestCase):
+    def test_different_target_dirs_get_distinct_locks(self):
+        first = dd._snapshot_lock_for(Path("datasets/TacVerse/a"))
+        second = dd._snapshot_lock_for(Path("datasets/TacVerse/b"))
+
+        self.assertIsNot(first, second)
+        self.assertIs(first, dd._snapshot_lock_for(Path("datasets/TacVerse/a")))
+
 
 class PullDatasetRetryTests(unittest.TestCase):
     def setUp(self):

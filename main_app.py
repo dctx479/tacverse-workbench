@@ -513,6 +513,10 @@ class FrozenDatasetTable(QWidget):
         self.fixed.setSelectionBehavior(behavior)
         self.detail.setSelectionBehavior(behavior)
 
+    def setSelectionMode(self, mode):
+        self.fixed.setSelectionMode(mode)
+        self.detail.setSelectionMode(mode)
+
     def setRowCount(self, rows):
         self.fixed.setRowCount(rows)
         self.detail.setRowCount(rows)
@@ -558,14 +562,35 @@ class FrozenDatasetTable(QWidget):
         self.detail.blockSignals(False)
         self.itemSelectionChanged.emit()
 
+    def selectedRows(self):
+        rows = set()
+        for table in (self.fixed, self.detail):
+            rows.update(index.row() for index in table.selectionModel().selectedIndexes())
+        if not rows:
+            row = self.currentRow()
+            if row >= 0:
+                rows.add(row)
+        return sorted(rows)
+
     def _handle_cell_clicked(self, row, column):
-        self.selectRow(row)
+        modifiers = QApplication.keyboardModifiers()
+        if not (modifiers & (Qt.ControlModifier | Qt.ShiftModifier)):
+            self.selectRow(row)
         self.cellClicked.emit(row, column)
 
     def _sync_selection(self, source):
-        row = source.currentRow()
-        if row >= 0:
-            self.selectRow(row)
+        target = self.detail if source is self.fixed else self.fixed
+        rows = sorted({
+            index.row() for index in source.selectionModel().selectedIndexes()
+            if 0 <= index.row() < target.rowCount()
+        })
+        target.blockSignals(True)
+        target.clearSelection()
+        for row in rows:
+            target.selectRow(row)
+        target.blockSignals(False)
+        if rows:
+            self.itemSelectionChanged.emit()
 
     def sortItems(self, column, order=None):
         if order is None:
@@ -652,6 +677,8 @@ class DownloadOneWorker(QThread):
     def __init__(self, repo_id, out_dir, token):
         super().__init__()
         self.repo_id, self.out_dir, self.token = repo_id, out_dir, token
+        self.local_dir = ""
+        self.error_msg = ""
 
     def run(self):
         try:
@@ -662,9 +689,13 @@ class DownloadOneWorker(QThread):
                 self.repo_id, dataset_dir, revision=None, token=self.token,
                 log=self.log.emit,
             )
-            self.done.emit(str(dataset_dir / self.repo_id.split("/")[-1]))
+            self.local_dir = str(dataset_dir / self.repo_id.split("/")[-1])
         except Exception as exc:
-            self.error.emit(str(exc))
+            self.error_msg = str(exc)
+        else:
+            self.done.emit(self.local_dir)
+        if self.error_msg:
+            self.error.emit(self.error_msg)
 
 
 class StatsWorker(QThread):
@@ -1049,8 +1080,11 @@ class MainWindow(QWidget):
         self.worker = None
         self._pull_worker = None
         self._check_worker = None
-        self.dl_worker = None
-        self._download_done_path = ""
+        self._download_workers = []
+        self._download_started = 0
+        self._download_completed = 0
+        self._download_successes = []
+        self._download_failures = []
         self._download_message_box = None
         self._stats_worker = None
         self._closing = False
@@ -1233,7 +1267,9 @@ class MainWindow(QWidget):
         self.btn_stats = QPushButton("刷新统计")
         self.btn_stats.setToolTip("仅获取数据集元信息，不下载 Parquet 和视频，速度最快。")
         self.btn_download = QPushButton("下载选中")
-        self.btn_download.setToolTip("下载当前表格中选中的一个数据集。")
+        self.btn_download.setToolTip(
+            "下载当前表格中选中的一个或多个数据集；"
+            "可 Ctrl/Shift 多选，下载任务并行执行。")
         self.btn_pull = QPushButton("同步全部")
         self.btn_pull.setToolTip("下载当前组织下全部数据集，速度较慢并占用磁盘空间。")
         for button in (self.btn_stats, self.btn_download, self.btn_pull):
@@ -1443,6 +1479,7 @@ class MainWindow(QWidget):
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.verticalHeader().setVisible(False)
         self.table.cellClicked.connect(self._on_table_cell_clicked)
         self.table.cellDoubleClicked.connect(self._open_row_link)
@@ -3117,6 +3154,21 @@ class MainWindow(QWidget):
         item = self.table.item(row, 0)
         return item.data(Qt.UserRole) if item else None
 
+    def _selected_datasets(self):
+        """Return unique selected datasets in table order, skipping hidden rows."""
+        datasets = []
+        seen = set()
+        for row in self.table.selectedRows():
+            if self.table.fixed.isRowHidden(row):
+                continue
+            item = self.table.item(row, 0)
+            d = item.data(Qt.UserRole) if item else None
+            name = (d or {}).get("dataset_name")
+            if name and name not in seen:
+                seen.add(name)
+                datasets.append(d)
+        return datasets
+
     def _show_prompt_empty(self, msg):
         """Show only the centered fallback label (nothing selected)."""
         self.prompt_empty.setText(msg)
@@ -4348,7 +4400,7 @@ class MainWindow(QWidget):
             setattr(self, attr, None)
         if worker is self.worker:
             self.worker = None
-        self._set_busy(False)
+        self._refresh_action_states()
         if worker is not None:
             worker.deleteLater()
 
@@ -4403,7 +4455,12 @@ class MainWindow(QWidget):
             if not qw.wait(8000):
                 qw.terminate()
                 qw.wait(2000)
-        for name in ("worker", "_pull_worker", "_check_worker", "dl_worker",
+        for w in list(self._download_workers):
+            if w.isRunning():
+                if not w.wait(5000):
+                    w.terminate()
+                    w.wait(2000)
+        for name in ("worker", "_pull_worker", "_check_worker",
                      "_edit_worker", "_push_worker", "_op_worker"):
             w = getattr(self, name, None)
             if w is not None and hasattr(w, "wait") and w.isRunning():
@@ -4425,16 +4482,41 @@ class MainWindow(QWidget):
         super().closeEvent(event)
 
     # ---- Button handlers -------------------------------------------------- #
-    def _set_busy(self, busy):
-        for b in (self.btn_pull, self.btn_stats, self.btn_download,
-                  self.btn_check, self.btn_manual_stats, self.btn_open):
-            b.setEnabled(not busy)
-        # Edit-tab actions share the busy lock so a copy/push can't overlap a pull.
+    def _refresh_action_states(self):
+        global_busy = any(
+            getattr(self, attr, None) is not None
+            for attr in ("_pull_worker", "_check_worker",
+                         "_edit_worker", "_push_worker", "_op_worker"))
+        stats_busy = getattr(self, "_stats_worker", None) is not None
+        downloads_busy = bool(getattr(self, "_download_workers", ()))
+        any_busy = global_busy or stats_busy or downloads_busy
+
+        self.btn_pull.setEnabled(
+            not global_busy and not stats_busy and not downloads_busy)
+        self.btn_stats.setEnabled(not global_busy and not stats_busy)
+        self.btn_download.setEnabled(not global_busy)
+        self.btn_check.setEnabled(
+            not global_busy and not stats_busy and not downloads_busy)
+        self.btn_manual_stats.setEnabled(
+            not global_busy and not stats_busy and not downloads_busy)
+        self.btn_open.setEnabled(not any_busy)
         if hasattr(self, "btn_make_copy"):
-            self.btn_make_copy.setEnabled(not busy)
-            self.btn_run_op.setEnabled(not busy)
+            self.btn_make_copy.setEnabled(not any_busy)
+            self.btn_run_op.setEnabled(not any_busy)
             self.btn_push_copy.setEnabled(
-                not busy and self._last_copy_dir is not None)
+                not any_busy and self._last_copy_dir is not None)
+
+    def _set_busy(self, busy):
+        if busy:
+            for b in (self.btn_pull, self.btn_stats, self.btn_download,
+                      self.btn_check, self.btn_manual_stats, self.btn_open):
+                b.setEnabled(False)
+            if hasattr(self, "btn_make_copy"):
+                self.btn_make_copy.setEnabled(False)
+                self.btn_run_op.setEnabled(False)
+                self.btn_push_copy.setEnabled(False)
+        else:
+            self._refresh_action_states()
 
     def on_pull(self):
         org = self.org_combo.currentText().strip()
@@ -4460,70 +4542,141 @@ class MainWindow(QWidget):
         worker.start()
 
     def on_download_selected(self):
-        """Download ONLY the dataset selected in the 看板 table (fast path)."""
-        d = self._selected_dataset()
-        if not d or not d.get("dataset_name"):
+        """Download all datasets selected in the 看板 table in parallel."""
+        datasets = self._selected_datasets()
+        if not datasets:
             QMessageBox.warning(self, "提示", "请先在「看板」表格里选中一个数据集。")
             return
-        repo_id = d["dataset_name"]
-        self._set_busy(True)
-        self.bar.setMaximum(0)  # indeterminate — a single snapshot download
+        if not self._download_workers:
+            self._download_started = 0
+            self._download_completed = 0
+            self._download_successes = []
+            self._download_failures = []
+        running = {w.repo_id for w in self._download_workers}
+        pending = [
+            d for d in datasets
+            if d.get("dataset_name") not in running
+        ]
+        if not pending:
+            QMessageBox.information(self, "提示", "选中的数据集已在下载中。")
+            return
+
         self._watch_dir = Path(OUT_DIR)
         self._prev_bytes = dir_size(self._watch_dir)
         self._prev_t = time.monotonic()
         self.speed_label.setText("0.0 B/s")
-        self.speed_timer.start()
-        self.status.setText(f"开始下载 {repo_id} ...")
-        worker = DownloadOneWorker(repo_id, OUT_DIR, self.token)
-        self.dl_worker = worker
-        worker.log.connect(self.status.setText)
-        worker.done.connect(self._on_download_one_done)
-        worker.error.connect(self._on_download_error)
-        worker.finished.connect(self._on_download_worker_finished)
-        worker.start()
+        if not self.speed_timer.isActive():
+            self.speed_timer.start()
+        for d in pending:
+            repo_id = d["dataset_name"]
+            self._download_started += 1
+            worker = DownloadOneWorker(repo_id, OUT_DIR, self.token)
+            self._download_workers.append(worker)
+            worker.log.connect(self.status.setText)
+            worker.done.connect(self._on_download_one_done)
+            worker.error.connect(self._on_download_error)
+            worker.finished.connect(self._on_download_worker_finished)
+            worker.start()
+        self.status.setText(f"开始下载 {len(pending)} 个数据集 ...")
+        self._refresh_download_progress()
+        self._refresh_action_states()
 
     def _on_download_one_done(self, local_dir):
-        self._stop_speed()
-        self.bar.setMaximum(1)
-        self.bar.setValue(1)
+        worker = self.sender()
+        if worker is not None:
+            worker.local_dir = local_dir
         self._refresh_table()  # the newly downloaded row now shows 已下载
-        self._download_done_path = local_dir
-        msg = f"下载完成: {local_dir}"
-        self.status.setText(msg)
+        if self._download_workers:
+            self.status.setText(f"下载完成: {local_dir}")
+        self._refresh_download_progress()
 
     def _on_download_error(self, msg):
-        """Show a download failure; finished releases the worker/busy lock."""
-        self._stop_speed()
-        self._download_done_path = ""
+        """Show a download failure; other workers keep running."""
+        worker = self.sender()
+        if worker is not None:
+            worker.error_msg = msg
         self.status.setText(f"错误: {msg}")
         QMessageBox.critical(self, "错误", msg)
+        self._refresh_download_progress()
 
     def _on_download_worker_finished(self):
-        """Release the download worker only after QThread has stopped."""
+        """Finalize the download UI and release the worker after QThread stops.
+
+        With multiple workers, this slot owns the final batch summary; the done
+        signal only refreshes the table and status as each dataset lands.
+        """
         worker = self.sender()
-        if worker is self.dl_worker:
-            self.dl_worker = None
-        self._set_busy(False)
+        if worker is not None and worker in self._download_workers:
+            self._download_workers.remove(worker)
+            if worker.local_dir:
+                self._download_successes.append(worker.local_dir)
+            elif worker.error_msg:
+                self._download_failures.append(worker.error_msg)
+            self._download_completed += 1
+        elif worker is not None:
+            if worker.local_dir:
+                self._download_successes.append(worker.local_dir)
+            elif worker.error_msg:
+                self._download_failures.append(worker.error_msg)
         if worker is not None:
             worker.deleteLater()
-        local_dir = self._download_done_path
-        self._download_done_path = ""
-        if local_dir:
+        self._refresh_download_progress()
+        if not self._download_workers:
+            self._finish_download_batch()
+        self._refresh_action_states()
+
+    def _refresh_download_progress(self):
+        if self._download_workers:
+            if not self.speed_timer.isActive():
+                self.speed_timer.start()
+            self.bar.setMaximum(max(self._download_started, 1))
+            self.bar.setValue(self._download_completed)
+        elif self._pull_worker is None and self._stats_worker is None:
+            self._stop_speed()
+
+    def _finish_download_batch(self):
+        self._stop_speed()
+        ok = len(self._download_successes)
+        failed = len(self._download_failures)
+        if ok == 1 and not failed:
+            msg = f"下载完成: {self._download_successes[0]}"
+        elif ok and not failed:
+            msg = f"下载完成: {ok} 个数据集"
+        elif ok:
+            msg = f"下载完成: {ok} 个，失败 {failed} 个"
+        else:
+            msg = f"下载失败: {failed} 个数据集"
+        self.status.setText(msg)
+        self.bar.setMaximum(1)
+        self.bar.setValue(1 if ok else 0)
+        if ok:
+            lines = list(self._download_successes[:10])
+            if len(self._download_successes) > 10:
+                lines.append(
+                    f"… 其余 {len(self._download_successes) - 10} 个")
+            if failed:
+                lines.append(f"失败 {failed} 个数据集")
             box = QMessageBox(
-                QMessageBox.Information, "完成", f"已下载到本地:\n{local_dir}",
+                QMessageBox.Information, "完成", "\n".join(lines),
                 QMessageBox.Ok, self)
             box.setAttribute(Qt.WA_DeleteOnClose)
             self._download_message_box = box
             box.finished.connect(
                 lambda *_: setattr(self, "_download_message_box", None))
             box.open()
+        self._download_successes = []
+        self._download_failures = []
+        self._download_started = 0
+        self._download_completed = 0
 
     def on_stats(self):
         org = self.org_combo.currentText().strip()
         if not org:
             QMessageBox.warning(self, "提示", "请填写组织名。")
             return
-        self._set_busy(True)
+        if self._stats_worker is not None:
+            QMessageBox.warning(self, "提示", "刷新统计已在运行。")
+            return
         self.bar.setValue(0)
         self.status.setText(f"开始统计 {org}（仅读取信息，不下载）...")
         worker = StatsWorker(org, self.token)
@@ -4538,6 +4691,7 @@ class MainWindow(QWidget):
         worker.error.connect(self._on_stats_error)
         worker.finished.connect(self._on_stats_worker_finished)
         worker.start()
+        self._refresh_action_states()
 
     def _on_stats_error(self, msg):
         """Show a stats failure; _on_stats_worker_finished unlocks the UI."""
@@ -4552,7 +4706,8 @@ class MainWindow(QWidget):
             self._stats_worker = None
         if worker is self.worker:
             self.worker = None
-        self._set_busy(False)
+        self._refresh_action_states()
+        self._refresh_download_progress()
         if worker is not None:
             worker.deleteLater()
 
@@ -4695,7 +4850,8 @@ class MainWindow(QWidget):
             self._pull_worker = None
         if worker is self.worker:
             self.worker = None
-        self._set_busy(False)
+        self._refresh_action_states()
+        self._refresh_download_progress()
         if worker is not None:
             worker.deleteLater()
 
@@ -4759,7 +4915,7 @@ class MainWindow(QWidget):
 
     def _on_error(self, msg):
         self._stop_speed()
-        self._set_busy(False)
+        self._refresh_action_states()
         self.status.setText(f"错误: {msg}")
         QMessageBox.critical(self, "错误", msg)
 
