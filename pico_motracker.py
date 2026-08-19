@@ -10,9 +10,6 @@ from dataclasses import dataclass, field
 import json
 from pathlib import Path
 
-import numpy as np
-import pyarrow.parquet as pq
-
 
 DEFAULTS = {
     "source": "observation.state",
@@ -23,6 +20,15 @@ DEFAULTS = {
     # every event.  Only the first N event details are retained for rendering.
     "max_event_details": 1000,
 }
+
+
+def _load_scan_dependencies():
+    try:
+        import numpy as np
+        import pyarrow.parquet as pq
+    except Exception as exc:
+        raise ValueError(f"缺少 PICO 轨迹检查依赖 numpy/pyarrow: {exc}") from exc
+    return np, pq
 
 
 @dataclass(frozen=True)
@@ -118,6 +124,7 @@ def detect(dataset_dir, cfg=None):
     Only consecutive frames inside the same episode are compared.  This avoids
     treating episode boundaries or missing frame ranges as tracker jumps.
     """
+    np, pq = _load_scan_dependencies()
     config = resolve_config(cfg)
     source = config["source"]
     hand_indices = _feature_indices(dataset_dir, source, config["hands"])

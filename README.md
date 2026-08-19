@@ -17,7 +17,7 @@
 - **团队看板 GUI**（PySide6），页签：
   - **看板**：KPI 卡片（数据集总数 / 总小时 / 总 episodes / 今日新增小时 / 今日新增 episodes / 目标完成度 / **今日 MVP ⭐**）+ 可排序筛选的数据集表格（含 **均时长(s)** 质量指标、robot_type、任务数、HF ID、上传者中文名、最后更新、今日新增）。表格默认按 HF「最近更新」排序，和网页一致。
   - **趋势**：每日新增小时（柱，仅显示实际拉取过的日期，不留空白）+ 累计小时（折线）。
-  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠）。
+  - **分组统计**：按 上传者 / 任务 / robot_type 维度汇总（横向柱状，中文名不重叠），并以 Hugging Face `last_modified` 归日、优先使用 commit history 差分、缺失时用本地快照兜底展示单组单日新增总时长。
   - **数据集编辑**：左侧是与看板一致的数据集详情表（选中要操作的数据集）；右侧两组功能——① **改名 / 改 Prompt**（本地 pyarrow 生成新副本，可推送回 Hub）；② 调用 lerobot 官方 `dataset_tools` 的 **删除 episodes / 拆分 / 合并 / 增加特征 / 删除特征**。详见下方[「数据集编辑」](#数据集编辑生成新副本不改动原数据)。
   - **Viewer**：内嵌 `xense_lerobot_viewer`（Next.js），3D 回放 / 语言标注 / 标签编辑；Viewer 数据根固定为 `datasets/<组织名>/`，可直接发现该组织目录下的全部本地数据集。
   - **Episode 时长定位**：选中已下载的数据集后，检查面板中的 `STATISTICS` 会按时长区间列出 episode 数量；展开区间即可查看具体 `ep`、实际秒数和 frames，用于快速定位过短或过长的数据。
@@ -26,6 +26,7 @@
 - **PICO MoTracker 轨迹检查**：在右侧「检查规则」中点击按钮后，针对当前已下载数据集按固定阈值扫描 `left_tcp` / `right_tcp` 的相邻帧；同时检查单轴位移和 XYZ 三维位移，并按 Episode 展示帧号、时间、变化量和命中的阈值。该扫描不会随切换数据集自动启动。
 - **Viewer Doctor 诊断**：右侧「数据集检查分区」可切换到 Doctor 页面，调用 vendored viewer 的 TypeScript 诊断接口；支持前 N 个、全部或自定义 Episode 范围，流式显示进度，按 PASS/WARN/FAIL 展开检查结果，并可导出 JSON 报告。Doctor 与 Workbench 的 PICO 固定阈值检查相互独立。
 - **双行功能工具栏**：顶部操作按职责分为两行。第一行集中 `数据源 / 数据获取 / 数据维护`，提供组织选择、刷新统计、下载选中、同步全部、检查新增、手动补录和数据目录；第二行集中 `账号 / Viewer / 目标`，显示登录状态、Viewer 服务控制、打开选中数据集、每日小时目标和当前时间。完整操作说明可通过按钮 tooltip 查看。
+- **Episode 深度质量检查**：手动扫描本地数据集，或按需缓存远程检查文件；定位首尾位姿偏差、轨迹突变、长时间静止、时长离群、画面闪烁/模糊/曝光/冻结和 JPEG 日志异常。检查在后台运行并支持取消，生成 Markdown / HTML / CSV / JSON 报告、问题视频切片和逐自由度轨迹图；问题可标记为确认、误报或已修复。触觉相机不会套用普通相机的模糊和冻结规则。
 - **登录状态指示器**：顶栏实时显示「已登录: xxx · 可见 N 个数据集」，一眼判断 token 权限是否正确（私有库需要有权限的账号才可见）。
 - **切换账号**：顶栏按钮，运行时粘贴新的 HF token 即可切换（仅本次运行有效，不落盘）。
 
@@ -33,31 +34,74 @@
 
 ## 环境安装
 
-### 1. Python 环境
+本项目支持 Windows、Ubuntu/Linux 和 macOS，使用 Python 3.10 或更高版本。
+**不要求创建或激活虚拟环境**：系统 Python、conda/mamba 环境或 `venv` 均可。安装依赖和启动程序时使用同一个 Python 解释器即可。
 
-推荐统一使用 `lerobot-xense`（mamba/conda）环境：
+### 1. 准备 Python 与 Git
 
-```bash
-mamba activate lerobot-xense
+检查当前解释器：
+
+```powershell
+# Windows PowerShell（也可使用 PATH 中的 python）
+py -3 --version
+git --version
 ```
 
-### 2. Python 依赖
-
 ```bash
-pip install "huggingface_hub" PySide6 pyqtgraph pyarrow
+# Ubuntu / macOS
+python3 --version
+git --version
 ```
 
-> `pyarrow` 用于读/写数据集的 `meta/*.parquet`（「数据集编辑」页签改 prompt 时会写回）；
-> 上传编辑后的副本用已有的 `huggingface_hub`。在 `lerobot-xense` 环境里这些通常已安装。
->
-> **务必在 `lerobot-xense` 环境里启动**（`mamba activate lerobot-xense && python main_app.py`）。
-> 「数据集编辑」页签里的 **删除/拆分/合并/增删特征** 会以子进程方式调用 lerobot 官方
-> `dataset_tools`，因此需要该环境里的 `lerobot` 包；改名 / 改 prompt 则是本地 pyarrow 实现，
-> 不依赖 lerobot。
+- Windows：可从 [python.org](https://www.python.org/downloads/windows/) 安装 64 位 Python；安装后若没有 `py` 命令，可将下文的 `py -3` 换成 `python`。
+- Ubuntu：如未安装，执行 `sudo apt update && sudo apt install -y python3 python3-pip git`。
+- macOS：可使用系统已有的 Python 3，或执行 `brew install python git`。不使用 Homebrew 时也可从 python.org 安装。
 
-### 3. 系统依赖（Linux 必装 ⚠️）
+如果是首次克隆仓库，建议同时拉取 Viewer 子模块：
 
-PySide6 6.5+ 的 Qt xcb 平台插件需要 `libxcb-cursor0`，**缺了会直接报错无法启动**：
+```bash
+git clone --recurse-submodules https://github.com/dctx479/tacverse-workbench.git
+```
+
+已经克隆的仓库可在项目根目录补拉子模块：
+
+```bash
+git submodule update --init --recursive
+```
+
+### 2. 完整安装依赖
+
+完整功能包括 GUI、统计/下载、改名 / 改 Prompt、深度质量检查、Viewer / Doctor，以及调用 LeRobot 官方 `dataset_tools` 的删除 / 拆分 / 合并 / 增删特征。安装 [Bun](https://bun.sh/) 后，在项目根目录执行：
+
+```powershell
+# Windows PowerShell
+py -3 -m pip install --upgrade pip
+py -3 scripts/install_all.py
+```
+
+```bash
+# Ubuntu / macOS
+python3 -m pip install --upgrade pip
+python3 scripts/install_all.py
+```
+
+`scripts/install_all.py` 会安装 `requirements-full.txt`，初始化 `third_party/lerobot_viewer` 子模块，并执行 `bun install`。使用 `py -3` / `python3` 的形式可以确保依赖安装到实际启动程序的解释器中。
+
+如果当前机器暂时不需要 LeRobot 数据集操作，可改用轻量安装：
+
+```bash
+python scripts/install_all.py --skip-lerobot
+```
+
+如果只想安装 Python 依赖、不安装 Viewer，可加 `--skip-viewer`。
+
+> 某些 Linux 发行版会限制向系统 Python 安装包。如果 `pip` 提示 `externally-managed-environment`，请使用发行版提供的 Python 包、conda/mamba，或自行选择 `venv`；这不是本项目的强制要求。
+
+### 3. 平台依赖
+
+Windows 和 macOS 通常无需额外的 GUI 系统库。
+
+Ubuntu/Linux 上，PySide6 6.5+ 的 Qt xcb 平台插件需要 `libxcb-cursor0`。缺少时会报错并无法启动：
 
 ```
 From 6.5.0, xcb-cursor0 or libxcb-cursor0 is needed to load the Qt xcb platform plugin.
@@ -70,7 +114,26 @@ sudo apt update
 sudo apt install -y libxcb-cursor0
 ```
 
-> 之前有同事反馈起不来，基本都是缺这个系统库。装上即可。
+如果仍提示缺少 xcb 库，请根据报错用当前 Linux 发行版的包管理器安装对应库；无桌面环境的服务器还需要 X11/Wayland 会话才能显示 GUI。
+
+### 4. 单独安装 Viewer
+
+**Viewer：** 需要仓库子模块、[Bun](https://bun.sh/) 和前端依赖。安装 Bun 后，在项目根目录执行：
+
+```bash
+python scripts/install_viewer.py
+```
+
+也可以手动执行：
+
+```bash
+git submodule update --init --recursive
+cd third_party/lerobot_viewer
+bun install
+cd ../..
+```
+
+上述 `cd` 和 `bun` 命令在 Windows PowerShell、Ubuntu 与 macOS 中通用。Viewer 未安装时，其他页签仍可正常使用。
 
 ---
 
@@ -87,21 +150,32 @@ TacVerse 的大部分数据集是**私有**的。HF 接口只会返回「当前 
 
 - **方式 A（推荐，一次生效）**：命令行登录，程序会自动读取缓存的登录 token：
   ```bash
-  huggingface-cli login      # 粘贴上面的 Read token
+  hf auth login              # Windows / Ubuntu / macOS 通用
   ```
-- **方式 B（临时）**：设置环境变量后启动：
+- **方式 B（临时）**：设置环境变量后启动。Windows PowerShell：
+  ```powershell
+  $env:HF_TOKEN = "hf_你的token"
+  py -3 main_app.py
+  ```
+  Ubuntu / macOS：
   ```bash
   export HF_TOKEN=hf_你的token
-  python main_app.py
+  python3 main_app.py
   ```
 - **方式 C（运行时）**：直接开 GUI，点顶栏 **「切换账号」** 粘贴 token。
 
-程序取 token 的优先级：`$HF_TOKEN` → `huggingface-cli login` 缓存 → 匿名。
+程序取 token 的优先级：`HF_TOKEN` 环境变量 → `hf auth login` 缓存 → 匿名。
 
 ### 验证 token 是否有权限
 
+```powershell
+# Windows PowerShell
+py -3 -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVerse/taccap-g1-candybowl-0702').private)"
+```
+
 ```bash
-python -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVerse/taccap-g1-candybowl-0702').private)"
+# Ubuntu / macOS
+python3 -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVerse/taccap-g1-candybowl-0702').private)"
 ```
 能打印 `True` 说明有权限；报 `404` 说明账号 / token 权限不够（需组织管理员把你的账号加进组织，或换经典 Read token）。启动 GUI 后，顶栏指示器显示的「可见 N 个」也能直接反映权限是否正确。
 
@@ -109,19 +183,39 @@ python -c "from huggingface_hub import HfApi; print(HfApi().dataset_info('TacVer
 
 ## 用法
 
+以下命令均在项目根目录执行。
+
 ### 命令行（批量拉取整个组织）
 
+Windows PowerShell：
+
+```powershell
+py -3 download_dataset.py                                # 拉取默认组织全部数据集
+py -3 download_dataset.py --org TacVerse                 # 指定组织
+py -3 download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
+```
+
+Ubuntu / macOS：
+
 ```bash
-python download_dataset.py                                # 拉取默认组织全部数据集
-python download_dataset.py --org <ORG>                    # 指定组织
-python download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
-python download_dataset.py --out-dir datasets/<ORG>       # 指定组织级本地目录
+python3 download_dataset.py                                # 拉取默认组织全部数据集
+python3 download_dataset.py --org TacVerse                 # 指定组织
+python3 download_dataset.py --repo-id A/x --repo-id B/y    # 只拉指定数据集
+python3 download_dataset.py --out-dir datasets/TacVerse    # 指定组织级本地目录
 ```
 
 ### 图形界面（团队看板）
 
+Windows PowerShell：
+
+```powershell
+py -3 main_app.py
+```
+
+Ubuntu / macOS：
+
 ```bash
-python main_app.py
+python3 main_app.py
 ```
 
 进去后：点 **「仅拉取统计信息」**（快，只读信息，不下载）、**「下载当前选中数据集」**（只下选中的一个，省时）或 **「拉取组织及其下所有数据集」**（全量下载 + 累积历史，较慢）。
@@ -236,6 +330,12 @@ Doctor 由 `third_party/lerobot_viewer` 提供，Workbench 通过 viewer 的 HTT
   - 每次“仅拉取统计信息”或完整拉取后更新，用于恢复 KPI、每日新增和趋势；同一组织每天只保留时间最新的一次结果，后拉取的数据会覆盖当天早先记录。因此**克隆仓库的人不需要 `datasets/` 也能看到历史趋势**。
   - 顶部“手动补录统计”可写入指定日期的四项累计总量。同一组织和日期再次录入会覆盖旧的手动值；同日后续真实统计会替代手动快照。
   - 手动快照不包含逐数据集信息，因此作为最新记录时不会显示数据集表格、分组统计或 MVP；“今日新增”由它与前一个有记录日期的累计值相减得到。
+- **`pull_history.local.json`**（本地运行历史，已被 git 忽略）：
+  - 兼容旧版的本地快照历史文件；新版本优先使用 `dataset_log.json`。
+  - 该文件只保存在本机，不提交到仓库。
+- **`hf_change_history.local.json`**（本地 HF 变更缓存，已被 git 忽略）：
+  - 程序以 Hugging Face `last_modified` 归日，优先使用 commit history 中 `meta/info.json` 的差分计算今日新增、MVP 和单组单日新增；缺失时使用本地快照兜底。
+  - 该缓存只保存在本机，不提交到仓库。
 - **`datasets/`**：拉取下来的原始数据集（含多 GB 视频），**已被 git 忽略**，不随代码同步，以节省仓库体积；组织目录下不再按日期分层。
 
 ---
@@ -245,8 +345,11 @@ Doctor 由 `third_party/lerobot_viewer` 提供，Workbench 通过 viewer 的 HTT
 - `main_app.py` —— PySide6 团队看板（GUI 入口）。
 - `download_dataset.py` —— 拉取 / 统计 / 分析 / 配置读写的核心逻辑（CLI 与 GUI 共用）。
 - `checks.py` —— 数据集质量检查插件注册表（命名 / 均时长 / Prompt 等规则）。
+- `dataset_quality.py` —— Qt-free Episode 深度质量扫描、问题切片、报告和复核状态持久化。
 - `pico_motracker.py` —— Qt-free PICO MoTracker 固定阈值轨迹跳变检测器。
 - `dataset_editor.py` —— 「改名 / 改 Prompt」的本地 pyarrow 实现（Qt-free，不依赖 lerobot）。
 - `lerobot_ops.py` / `lerobot_ops_runner.py` —— 删除 / 拆分 / 合并 / 增删特征：workbench 侧封装 + 调用 lerobot `dataset_tools` 的子进程执行器。
 - `config.json` —— 上传者中文名映射 + 质量检查阈值。
+- `pull_history.local.json` —— 本地拉取 / 统计历史（自动生成，git 忽略）。
 - `dataset_log.json` —— 自动统计和手动补录共用的轻量历史快照。
+- `hf_change_history.local.json` —— 本地 Hugging Face 变更历史缓存（自动生成，git 忽略）。

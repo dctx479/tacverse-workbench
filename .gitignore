@@ -3,6 +3,14 @@
 # root file ./dataset_log.json instead, so a clone gets history without datasets/.
 datasets/
 pulls/
+# Legacy migration input; dataset_log.json is now the authoritative history.
+pull_history.local.json
+# HF commit diffs are a rebuildable local cache layered over dataset_log.json.
+hf_change_history.local.json
+quality_status.local.json
+.quality_cache/
+.quality_reports/
+**/quality_clips/
 
 # Python virtual env / caches
 .venv/
@@ -19,6 +27,7 @@ __pycache__/
 
 # HF cache (if ever created here)
 .cache/
+vendor/
 
 # Locally-saved HF token from the 切换账号 dialog — never commit / share.
 .hf_token

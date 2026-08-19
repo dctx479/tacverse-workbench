@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -75,6 +76,18 @@ class PicoMotrackerTests(unittest.TestCase):
     def test_invalid_threshold_is_rejected(self):
         with self.assertRaises(ValueError):
             pico.resolve_config({"xyz_step_threshold": 0})
+
+    def test_missing_scan_dependency_is_reported_without_import_crash(self):
+        real_import = __import__
+
+        def blocked_import(name, *args, **kwargs):
+            if name == "numpy":
+                raise ImportError("missing numpy")
+            return real_import(name, *args, **kwargs)
+
+        with patch("builtins.__import__", side_effect=blocked_import):
+            with self.assertRaisesRegex(ValueError, "numpy/pyarrow"):
+                pico.detect(Path("/does/not/matter"))
 
 
 if __name__ == "__main__":

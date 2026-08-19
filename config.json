@@ -32,6 +32,36 @@
         "·"
       ]
     },
+    "local_quality": {
+      "start_end_window": 10,
+      "boundary_mad_factor": 6.0,
+      "boundary_abs_threshold": 0.2,
+      "jump_mad_factor": 14.0,
+      "jump_abs_threshold": 0.35,
+      "flicker_sample_step": 3,
+      "flicker_luma_threshold": 45.0,
+      "flicker_recover_ratio": 0.45,
+      "max_video_frames": 12000,
+      "blur_laplacian_threshold": 45.0,
+      "blur_rel_ratio": 0.12,
+      "blur_min_sec": 0.8,
+      "exposure_low_luma": 25.0,
+      "exposure_high_luma": 230.0,
+      "exposure_min_sec": 0.8,
+      "freeze_diff_threshold": 0.4,
+      "freeze_min_sec": 1.0,
+      "idle_epsilon": 0.004,
+      "idle_max_sec": 5.0,
+      "length_iqr_factor": 2.5,
+      "clip_margin_sec": 1.0,
+      "clip_lead_sec": 4.0,
+      "clip_max_sec": 10.0,
+      "remote_enabled": true,
+      "remote_cache_dir": ".quality_cache",
+      "report_dir": ".quality_reports",
+      "remote_max_episodes": 8,
+      "max_issues": 80
+    },
     "pico_motracker": {
       "source": "observation.state",
       "hands": [
@@ -45,6 +75,36 @@
       },
       "xyz_step_threshold": 0.35,
       "max_event_details": 1000
+    },
+    "local_quality": {
+      "start_end_window": 10,
+      "boundary_mad_factor": 6.0,
+      "boundary_abs_threshold": 0.2,
+      "jump_mad_factor": 14.0,
+      "jump_abs_threshold": 0.35,
+      "flicker_sample_step": 3,
+      "flicker_luma_threshold": 45.0,
+      "flicker_recover_ratio": 0.45,
+      "max_video_frames": 12000,
+      "blur_laplacian_threshold": 45.0,
+      "blur_rel_ratio": 0.12,
+      "blur_min_sec": 0.8,
+      "exposure_low_luma": 25.0,
+      "exposure_high_luma": 230.0,
+      "exposure_min_sec": 0.8,
+      "freeze_diff_threshold": 0.4,
+      "freeze_min_sec": 1.0,
+      "idle_epsilon": 0.004,
+      "idle_max_sec": 5.0,
+      "length_iqr_factor": 2.5,
+      "clip_margin_sec": 1.0,
+      "clip_lead_sec": 4.0,
+      "clip_max_sec": 10.0,
+      "remote_enabled": true,
+      "remote_cache_dir": ".quality_cache",
+      "report_dir": ".quality_reports",
+      "remote_max_episodes": 8,
+      "max_issues": 80
     }
   },
   "uploader_names": {
@@ -56,6 +116,10 @@
     "fza1796262052": "方占奥",
     "SkyhaoLi": "李天浩",
     "WBH333": "王宝合",
+    "XR-Bot0": "邬思彤",
+    "XR-Bot1": "邬思彤",
+    "XR-Bot3": "洪锐",
+    "XR-Bot4": "洪锐",
     "dctx": "白伟杰",
     "etince11e": "姜毅峰",
     "hubobi": "胡博",
@@ -66,6 +130,10 @@
     "yhsguejh": "莫凡",
     "shilin5499": "祝石林",
     "yangbaicai147": "杨蔡田雨",
-    "QiuDekang": "邱德康"
+    "QiuDekang": "邱德康",
+    "XR-Bot0": "邬思彤",
+    "XR-Bot1": "邬思彤",
+    "XR-Bot3": "洪锐",
+    "XR-Bot4": "洪锐"
   }
 }
