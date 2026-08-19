@@ -474,24 +474,37 @@ class FrozenDatasetTable(QWidget):
         self.detail.verticalHeader().setVisible(False)
         self.fixed.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
         self.fixed.setColumnWidth(0, frozen_width)
-        self.splitter.splitterMoved.connect(self._sync_fixed_column_width)
+        self.splitter.splitterMoved.connect(
+            lambda *args: self._safe_call(self._sync_fixed_column_width, *args))
 
         self.fixed.verticalScrollBar().valueChanged.connect(
             self.detail.verticalScrollBar().setValue)
         self.detail.verticalScrollBar().valueChanged.connect(
             self.fixed.verticalScrollBar().setValue)
         self.fixed.cellClicked.connect(
-            lambda row, _col: self._handle_cell_clicked(row, 0))
+            lambda row, _col: self._safe_call(self._handle_cell_clicked, row, 0))
         self.detail.cellClicked.connect(
-            lambda row, col: self._handle_cell_clicked(row, col + 1))
+            lambda row, col: self._safe_call(self._handle_cell_clicked, row, col + 1))
         self.fixed.cellDoubleClicked.connect(
             lambda row, col: self.cellDoubleClicked.emit(row, col))
         self.detail.cellDoubleClicked.connect(
             lambda row, col: self.cellDoubleClicked.emit(row, col + 1))
-        self.fixed.itemSelectionChanged.connect(lambda: self._sync_selection(self.fixed))
-        self.detail.itemSelectionChanged.connect(lambda: self._sync_selection(self.detail))
-        self.fixed.horizontalHeader().sectionClicked.connect(lambda _col: self.sortItems(0))
-        self.detail.horizontalHeader().sectionClicked.connect(lambda col: self.sortItems(col + 1))
+        self.fixed.itemSelectionChanged.connect(
+            lambda: self._safe_call(self._sync_selection, self.fixed))
+        self.detail.itemSelectionChanged.connect(
+            lambda: self._safe_call(self._sync_selection, self.detail))
+        self.fixed.horizontalHeader().sectionClicked.connect(
+            lambda _col: self._safe_call(self.sortItems, 0))
+        self.detail.horizontalHeader().sectionClicked.connect(
+            lambda col: self._safe_call(self.sortItems, col + 1))
+
+    @staticmethod
+    def _safe_call(func, *args):
+        try:
+            return func(*args)
+        except Exception:
+            traceback.print_exc()
+            return None
 
     def setHorizontalHeaderLabels(self, labels):
         self._columns = len(labels)
@@ -563,10 +576,12 @@ class FrozenDatasetTable(QWidget):
     def selectRow(self, row):
         self.fixed.blockSignals(True)
         self.detail.blockSignals(True)
-        self.fixed.selectRow(row)
-        self.detail.selectRow(row)
-        self.fixed.blockSignals(False)
-        self.detail.blockSignals(False)
+        try:
+            self.fixed.selectRow(row)
+            self.detail.selectRow(row)
+        finally:
+            self.fixed.blockSignals(False)
+            self.detail.blockSignals(False)
         self.itemSelectionChanged.emit()
 
     def selectedRows(self):
@@ -592,10 +607,12 @@ class FrozenDatasetTable(QWidget):
             if 0 <= index.row() < target.rowCount()
         })
         target.blockSignals(True)
-        target.clearSelection()
-        for row in rows:
-            target.selectRow(row)
-        target.blockSignals(False)
+        try:
+            target.clearSelection()
+            for row in rows:
+                target.selectRow(row)
+        finally:
+            target.blockSignals(False)
         if rows:
             self.itemSelectionChanged.emit()
 
@@ -1148,10 +1165,12 @@ class MainWindow(QWidget):
         self._prev_t = None
         self.speed_timer = QTimer(self)
         self.speed_timer.setInterval(1000)
-        self.speed_timer.timeout.connect(self._tick_speed)
+        self.speed_timer.timeout.connect(
+            self._guarded("测速刷新", self._tick_speed, stop_speed=False))
         self.quality_status_timer = QTimer(self)
         self.quality_status_timer.setInterval(3000)
-        self.quality_status_timer.timeout.connect(self._sync_quality_status_from_disk)
+        self.quality_status_timer.timeout.connect(
+            self._guarded("同步检查状态", self._sync_quality_status_from_disk))
         self.quality_status_timer.start()
         app = QApplication.instance()
         if app is not None:
@@ -1166,16 +1185,32 @@ class MainWindow(QWidget):
         except OSError as exc:
             migration_note = f"；旧历史迁移失败: {exc}"
         active_org = self.org_combo.currentText().strip() or dd.ORG
-        self.history = dd.load_history(OUT_DIR, org=active_org)
-        self.hf_changes = dd.load_hf_change_history()
+        try:
+            self.history = dd.load_history(OUT_DIR, org=active_org)
+            self.hf_changes = dd.load_hf_change_history()
+        except Exception as exc:
+            traceback.print_exception(type(exc), exc, exc.__traceback__)
+            self.history = []
+            self.hf_changes = {"version": 1, "repos": {}}
+            migration_note += f"；本地历史读取失败: {exc}"
         last = self.history[-1] if self.history else None
         if last:
             self.report = last
-            self._refresh_all()
-            self._show_stale_banner(last)
+            try:
+                self._refresh_all()
+                self._show_stale_banner(last)
+            except Exception as exc:
+                self._handle_ui_exception("加载本地快照", exc, stop_speed=False)
+                self.report = None
+                self.history = []
+                self._set_rollup_range_defaults()
+                self._refresh_rollup()
         else:
             self._set_rollup_range_defaults()
-            self._refresh_rollup()
+            try:
+                self._refresh_rollup()
+            except Exception as exc:
+                self._handle_ui_exception("初始化分组统计", exc, stop_speed=False)
         self.status.setText(
             "就绪：「仅拉取统计信息」(快) / 「下载当前选中数据集」/ "
             f"「拉取组织及其下所有数据集」{migration_note}。")
@@ -1264,8 +1299,10 @@ class MainWindow(QWidget):
         self.org_combo.addItems(RECENT_ORGS)
         self.org_combo.setMinimumWidth(160)
         self.org_combo.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-        self.org_combo.currentIndexChanged.connect(self._refresh_identity)
-        self.org_combo.lineEdit().editingFinished.connect(self._refresh_identity)
+        self.org_combo.currentIndexChanged.connect(
+            self._guarded("刷新登录状态", self._refresh_identity))
+        self.org_combo.lineEdit().editingFinished.connect(
+            self._guarded("刷新登录状态", self._refresh_identity))
         row1.addWidget(self.org_combo)
 
         separator(row1)
@@ -1289,12 +1326,14 @@ class MainWindow(QWidget):
         self.btn_manual_stats.setToolTip("手动补录某一天的数据集统计快照。")
         self.btn_open = QPushButton("数据目录")
         self.btn_open.setToolTip("打开本地 datasets/TacVerse/ 目录。")
-        self.btn_stats.clicked.connect(self.on_stats)
-        self.btn_download.clicked.connect(self.on_download_selected)
-        self.btn_pull.clicked.connect(self.on_pull)
-        self.btn_check.clicked.connect(self.on_check)
-        self.btn_manual_stats.clicked.connect(self.on_manual_stats)
-        self.btn_open.clicked.connect(self.on_open_dir)
+        self.btn_stats.clicked.connect(self._guarded("刷新统计", self.on_stats))
+        self.btn_download.clicked.connect(
+            self._guarded("下载选中数据集", self.on_download_selected))
+        self.btn_pull.clicked.connect(self._guarded("同步全部数据集", self.on_pull))
+        self.btn_check.clicked.connect(self._guarded("检查新增", self.on_check))
+        self.btn_manual_stats.clicked.connect(
+            self._guarded("手动补录统计", self.on_manual_stats))
+        self.btn_open.clicked.connect(self._guarded("打开数据目录", self.on_open_dir))
 
         primary_css = (
             "QPushButton { font-weight: bold; padding: 6px 13px; border-radius: 6px;"
@@ -1331,7 +1370,8 @@ class MainWindow(QWidget):
         self.btn_account = QPushButton("切换账号")
         self.btn_account.setStyleSheet(secondary_css)
         self.btn_account.setToolTip("切换 Hugging Face 账号或更新访问令牌。")
-        self.btn_account.clicked.connect(self.on_switch_account)
+        self.btn_account.clicked.connect(
+            self._guarded("切换账号", self.on_switch_account))
         row2.addWidget(self.btn_account)
         self.identity_label = QLabel("登录状态: 检测中…")
         self.identity_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
@@ -1350,10 +1390,14 @@ class MainWindow(QWidget):
         self.top_viewer_home = QPushButton("首页")
         self.open_viewer_btn = QPushButton("打开选中")
         self.open_viewer_btn.setToolTip("在浏览器的 Viewer 里打开选中的数据集")
-        self.top_viewer_start.clicked.connect(self._viewer_start)
-        self.top_viewer_stop.clicked.connect(self._viewer_stop)
-        self.top_viewer_home.clicked.connect(self._viewer_open_home)
-        self.open_viewer_btn.clicked.connect(self._open_selected_in_viewer)
+        self.top_viewer_start.clicked.connect(
+            self._guarded("启动 Viewer", self._viewer_start))
+        self.top_viewer_stop.clicked.connect(
+            self._guarded("停止 Viewer", self._viewer_stop))
+        self.top_viewer_home.clicked.connect(
+            self._guarded("打开 Viewer 首页", self._viewer_open_home))
+        self.open_viewer_btn.clicked.connect(
+            self._guarded("打开选中数据集 Viewer", self._open_selected_in_viewer))
         for b in (self.top_viewer_start, self.top_viewer_stop,
                   self.top_viewer_home, self.open_viewer_btn):
             b.setStyleSheet(secondary_css)
@@ -1365,7 +1409,8 @@ class MainWindow(QWidget):
         self.target_spin = QSpinBox()
         self.target_spin.setRange(0, 100000)
         self.target_spin.setValue(10)
-        self.target_spin.valueChanged.connect(self._refresh_kpis)
+        self.target_spin.valueChanged.connect(
+            self._guarded("刷新 KPI", self._refresh_kpis))
         self.target_spin.setFixedWidth(72)
         self.target_spin.setToolTip("用于计算看板中的每日目标完成度。")
         row2.addWidget(self.target_spin)
@@ -1377,7 +1422,8 @@ class MainWindow(QWidget):
         self.clock_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         row2.addWidget(self.clock_label)
         self.clock_timer = QTimer(self)
-        self.clock_timer.timeout.connect(self._tick_clock)
+        self.clock_timer.timeout.connect(
+            self._guarded("刷新时钟", self._tick_clock))
         self.clock_timer.start(1000)
         self._tick_clock()
         toolbar.addLayout(row1)
@@ -1469,10 +1515,12 @@ class MainWindow(QWidget):
         filt.addWidget(QLabel("筛选:"))
         self.filter_edit = QLineEdit()
         self.filter_edit.setPlaceholderText("按 名称 / robot_type / 上传者 过滤…")
-        self.filter_edit.textChanged.connect(self._apply_filter)
+        self.filter_edit.textChanged.connect(
+            self._guarded("筛选看板", self._apply_filter))
         filt.addWidget(self.filter_edit)
         self.only_issues = QCheckBox("只看有问题的")
-        self.only_issues.toggled.connect(self._apply_filter)
+        self.only_issues.toggled.connect(
+            self._guarded("筛选问题数据集", self._apply_filter))
         filt.addWidget(self.only_issues)
         lv.addLayout(filt)
 
@@ -1481,15 +1529,18 @@ class MainWindow(QWidget):
             0, len(TABLE_COLS), frozen_width=self.dataset_column_width)
         self.table.setHorizontalHeaderLabels([c[0] for c in TABLE_COLS])
         self.table.horizontalHeaderItem(LOCAL_COL).setToolTip(
-            "本地文件表示原始数据是否已下载到 pulls/，已下载的数据集可在 Viewer 打开。")
+            "本地文件表示原始数据是否已下载到 datasets/<组织名>/，已下载的数据集可在 Viewer 打开。")
         self.table.setSortingEnabled(True)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.verticalHeader().setVisible(False)
-        self.table.cellClicked.connect(self._on_table_cell_clicked)
-        self.table.cellDoubleClicked.connect(self._open_row_link)
-        self.table.itemSelectionChanged.connect(self._on_dataset_selected)
+        self.table.cellClicked.connect(
+            self._guarded("打开检查报告入口", self._on_table_cell_clicked, pass_args=True))
+        self.table.cellDoubleClicked.connect(
+            self._guarded("打开 HF 页面", self._open_row_link, pass_args=True))
+        self.table.itemSelectionChanged.connect(
+            self._guarded("刷新数据集详情面板", self._on_dataset_selected))
         hdr = self.table.detail.horizontalHeader()
         for i in range(self.table.detail.columnCount()):
             hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
@@ -1521,7 +1572,8 @@ class MainWindow(QWidget):
             width = split.width()
             if width > 1:
                 split.setSizes([width // 2, width - width // 2])
-        QTimer.singleShot(0, equalize_main_splitter)
+        QTimer.singleShot(
+            0, self._guarded("初始化主分割栏", equalize_main_splitter))
         outer.addWidget(split)
         return w
 
@@ -1585,9 +1637,9 @@ class MainWindow(QWidget):
             button.setAutoExclusive(True)
         self.data_check_mode_button.setChecked(True)
         self.data_check_mode_button.clicked.connect(
-            lambda: self._set_detail_mode("checks"))
+            self._guarded("切换数据检查视图", lambda: self._set_detail_mode("checks")))
         self.doctor_mode_button.clicked.connect(
-            lambda: self._set_detail_mode("doctor"))
+            self._guarded("切换 Doctor 视图", lambda: self._set_detail_mode("doctor")))
         mode_row.addWidget(self.data_check_mode_button)
         mode_row.addWidget(self.doctor_mode_button)
         mode_row.addStretch(1)
@@ -1625,7 +1677,8 @@ class MainWindow(QWidget):
         ep_row = QHBoxLayout()
         ep_row.addWidget(QLabel("集:"))
         self.prompt_ep = QComboBox()
-        self.prompt_ep.currentIndexChanged.connect(self._refresh_prompt_tree)
+        self.prompt_ep.currentIndexChanged.connect(
+            self._guarded("刷新语言标注", self._refresh_prompt_tree))
         ep_row.addWidget(self.prompt_ep, 1)
         self.prompt_ep_wrap = QWidget()
         self.prompt_ep_wrap.setLayout(ep_row)
@@ -1688,18 +1741,24 @@ class MainWindow(QWidget):
         self.btn_quality_check = QPushButton("执行深度检查")
         self.btn_quality_check.setToolTip(
             "检查本地数据；未下载时按配置只缓存检查所需的远程文件。")
-        self.btn_quality_check.clicked.connect(self.on_quality_check)
+        self.btn_quality_check.clicked.connect(
+            self._guarded("执行深度检查", self.on_quality_check))
         self.btn_quality_cancel = QPushButton("取消")
         self.btn_quality_cancel.setEnabled(False)
-        self.btn_quality_cancel.clicked.connect(self.on_quality_cancel)
+        self.btn_quality_cancel.clicked.connect(
+            self._guarded("取消深度检查", self.on_quality_cancel))
         self.btn_open_quality_report = QPushButton("打开报告")
-        self.btn_open_quality_report.clicked.connect(self.on_open_quality_report)
+        self.btn_open_quality_report.clicked.connect(
+            self._guarded("打开检查报告", self.on_open_quality_report))
         self.btn_export_quality_report = QPushButton("导出 ZIP")
-        self.btn_export_quality_report.clicked.connect(self.on_export_quality_report)
+        self.btn_export_quality_report.clicked.connect(
+            self._guarded("导出检查报告", self.on_export_quality_report))
         self.btn_clear_quality_reports = QPushButton("清理报告")
-        self.btn_clear_quality_reports.clicked.connect(self.on_clear_quality_reports)
+        self.btn_clear_quality_reports.clicked.connect(
+            self._guarded("清理检查报告", self.on_clear_quality_reports))
         self.btn_clear_quality_cache = QPushButton("清理缓存")
-        self.btn_clear_quality_cache.clicked.connect(self.on_clear_quality_cache)
+        self.btn_clear_quality_cache.clicked.connect(
+            self._guarded("清理检查缓存", self.on_clear_quality_cache))
         for index, button in enumerate((
             self.btn_quality_check, self.btn_quality_cancel,
             self.btn_open_quality_report, self.btn_export_quality_report,
@@ -1719,7 +1778,8 @@ class MainWindow(QWidget):
         rul.addWidget(self.quality_note)
         pico_row = QHBoxLayout()
         self.pico_check_button = QPushButton("检查 PICO MoTracker 轨迹")
-        self.pico_check_button.clicked.connect(self._start_pico_check)
+        self.pico_check_button.clicked.connect(
+            self._guarded("检查 PICO MoTracker 轨迹", self._start_pico_check))
         pico_row.addWidget(self.pico_check_button)
         self.pico_check_status = QLabel("未检测")
         self.pico_check_status.setStyleSheet("color:#888; font-size:11px;")
@@ -1737,7 +1797,9 @@ class MainWindow(QWidget):
         for label in ("确认问题", "误报", "已修复", "未确认"):
             button = QPushButton(label)
             button.clicked.connect(
-                lambda _checked=False, status=label: self.on_mark_quality_issue(status))
+                self._guarded(
+                    f"标记问题为{label}",
+                    lambda status=label: self.on_mark_quality_issue(status)))
             review_actions.addWidget(button)
         rul.addLayout(review_actions)
         self.quality_issue_tree = QTreeWidget()
@@ -1833,7 +1895,8 @@ class MainWindow(QWidget):
         self.doctor_scope.addItem("前 100 个 Episode", {"maxEpisodes": 100})
         self.doctor_scope.addItem("全部 Episode", {"maxEpisodes": None})
         self.doctor_scope.addItem("自定义 Episode 范围", {"episodeRange": True})
-        self.doctor_scope.currentIndexChanged.connect(self._doctor_scope_changed)
+        self.doctor_scope.currentIndexChanged.connect(
+            self._guarded("切换 Doctor 范围", self._doctor_scope_changed))
         controls.addWidget(self.doctor_scope, 1)
         self.doctor_range_start = QSpinBox()
         self.doctor_range_start.setRange(0, 1_000_000)
@@ -1848,11 +1911,13 @@ class MainWindow(QWidget):
         self.doctor_range_end.setVisible(False)
         controls.addWidget(self.doctor_range_end)
         self.doctor_run_button = QPushButton("运行 Doctor")
-        self.doctor_run_button.clicked.connect(self._start_doctor)
+        self.doctor_run_button.clicked.connect(
+            self._guarded("运行 Doctor", self._start_doctor))
         controls.addWidget(self.doctor_run_button)
         self.doctor_export_button = QPushButton("导出 JSON")
         self.doctor_export_button.setEnabled(False)
-        self.doctor_export_button.clicked.connect(self._export_doctor)
+        self.doctor_export_button.clicked.connect(
+            self._guarded("导出 Doctor JSON", self._export_doctor))
         controls.addWidget(self.doctor_export_button)
         layout.addLayout(controls)
 
@@ -1975,7 +2040,8 @@ class MainWindow(QWidget):
         self.trend_plot.getAxis("right").linkToView(self.trend_cum_view)
         self.trend_cum_view.setXLink(self.trend_plot)
         self.trend_plot.hideAxis("right")
-        self.trend_plot.getViewBox().sigResized.connect(self._sync_trend_cum_view)
+        self.trend_plot.getViewBox().sigResized.connect(
+            self._guarded("同步趋势图坐标", self._sync_trend_cum_view))
         v.addWidget(self.trend_plot, 1)
         return w
 
@@ -1993,7 +2059,8 @@ class MainWindow(QWidget):
         row.addWidget(QLabel("分组维度:"))
         self.dim_combo = QComboBox()
         self.dim_combo.addItems(list(ROLLUP_DIMS.keys()))
-        self.dim_combo.currentTextChanged.connect(self._refresh_rollup)
+        self.dim_combo.currentTextChanged.connect(
+            self._guarded("刷新分组统计", self._refresh_rollup))
         row.addWidget(self.dim_combo)
         row.addSpacing(12)
         row.addWidget(QLabel("时间范围:"))
@@ -2009,10 +2076,12 @@ class MainWindow(QWidget):
         self.rollup_end_date.setToolTip("区间结束日期")
         row.addWidget(self.rollup_end_date)
         self.rollup_apply_btn = QPushButton("应用")
-        self.rollup_apply_btn.clicked.connect(self._refresh_rollup)
+        self.rollup_apply_btn.clicked.connect(
+            self._guarded("应用分组统计范围", self._refresh_rollup))
         row.addWidget(self.rollup_apply_btn)
         self.rollup_reset_btn = QPushButton("全量")
-        self.rollup_reset_btn.clicked.connect(self._reset_rollup_range)
+        self.rollup_reset_btn.clicked.connect(
+            self._guarded("重置分组统计范围", self._reset_rollup_range))
         row.addWidget(self.rollup_reset_btn)
         row.addStretch()
         v.addLayout(row)
@@ -2106,11 +2175,13 @@ class MainWindow(QWidget):
         ef.addWidget(QLabel("筛选:"))
         self.edit_filter = QLineEdit()
         self.edit_filter.setPlaceholderText("按 名称 / robot_type / 上传者 过滤…")
-        self.edit_filter.textChanged.connect(self._apply_edit_filter)
+        self.edit_filter.textChanged.connect(
+            self._guarded("筛选编辑表格", self._apply_edit_filter))
         ef.addWidget(self.edit_filter)
         self.edit_only_downloaded = QCheckBox("只看已下载")
         self.edit_only_downloaded.setChecked(True)
-        self.edit_only_downloaded.toggled.connect(self._apply_edit_filter)
+        self.edit_only_downloaded.toggled.connect(
+            self._guarded("筛选已下载数据集", self._apply_edit_filter))
         ef.addWidget(self.edit_only_downloaded)
         lv.addLayout(ef)
 
@@ -2123,7 +2194,8 @@ class MainWindow(QWidget):
         self.edit_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.edit_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.edit_table.verticalHeader().setVisible(False)
-        self.edit_table.itemSelectionChanged.connect(self._refresh_edit_tab)
+        self.edit_table.itemSelectionChanged.connect(
+            self._guarded("刷新编辑面板", self._refresh_edit_tab))
         ehdr = self.edit_table.horizontalHeader()
         ehdr.setSectionResizeMode(0, QHeaderView.Interactive)
         for i in range(1, len(TABLE_COLS)):
@@ -2171,7 +2243,8 @@ class MainWindow(QWidget):
             f" color:white; background:{UI_COLORS['green']}; }}"
             f"QPushButton:hover {{ background:{UI_COLORS['green_hover']}; }}"
             "QPushButton:disabled { background:#B0B0B0; }")
-        self.btn_make_copy.clicked.connect(self.on_make_copy)
+        self.btn_make_copy.clicked.connect(
+            self._guarded("生成数据集副本", self.on_make_copy))
         self.btn_push_copy = QPushButton("推送到 Hub")
         self.btn_push_copy.setMinimumHeight(32)
         self.btn_push_copy.setStyleSheet(
@@ -2179,7 +2252,8 @@ class MainWindow(QWidget):
             f" border:1px solid {UI_COLORS['border_strong']}; background:{UI_COLORS['surface']}; }}"
             "QPushButton:hover { background:#F2F4F7; border-color:#98A2B3; }"
             f"QPushButton:disabled {{ color:{UI_COLORS['text_disabled']}; }}")
-        self.btn_push_copy.clicked.connect(self.on_push_copy)
+        self.btn_push_copy.clicked.connect(
+            self._guarded("推送数据集副本", self.on_push_copy))
         arow.addWidget(self.btn_make_copy)
         arow.addWidget(self.btn_push_copy)
         arow.addStretch()
@@ -2194,7 +2268,8 @@ class MainWindow(QWidget):
         self.op_combo = QComboBox()
         self.op_combo.addItems(
             ["删除 episodes", "拆分数据集", "合并数据集", "增加特征", "删除特征"])
-        self.op_combo.currentIndexChanged.connect(self._on_op_changed)
+        self.op_combo.currentIndexChanged.connect(
+            self._guarded("切换数据集操作", self._on_op_changed, pass_args=True))
         oprow.addWidget(self.op_combo, 1)
         bv.addLayout(oprow)
         self.op_stack = QStackedWidget()
@@ -2211,7 +2286,8 @@ class MainWindow(QWidget):
             f" color:white; background:{UI_COLORS['blue']}; }}"
             f"QPushButton:hover {{ background:{UI_COLORS['blue_hover']}; }}"
             "QPushButton:disabled { background:#B0B0B0; }")
-        self.btn_run_op.clicked.connect(self.on_run_op)
+        self.btn_run_op.clicked.connect(
+            self._guarded("执行数据集操作", self.on_run_op))
         bv.addWidget(self.btn_run_op)
         self.op_note = QLabel(
             "所有操作只写到新的 datasets/<组织名>/<输出名> 目录；若目标已存在会停止，源数据目录不覆盖。")
@@ -2494,8 +2570,10 @@ class MainWindow(QWidget):
         self.status.setText(f"生成副本 {dst} ...")
         self.edit_result.setText("")
         self._edit_worker = EditWorker(str(src), str(dst), replacements)
-        self._edit_worker.done.connect(self._on_edit_done)
-        self._edit_worker.error.connect(self._on_worker_error)
+        self._edit_worker.done.connect(
+            self._guarded("生成数据集副本", self._on_edit_done, pass_args=True))
+        self._edit_worker.error.connect(
+            self._guarded("生成数据集副本", self._on_worker_error, pass_args=True))
         self._edit_worker.finished.connect(
             lambda worker=self._edit_worker:
             self._on_one_shot_worker_finished("_edit_worker", worker))
@@ -2538,8 +2616,10 @@ class MainWindow(QWidget):
         self.status.setText(f"上传到 {repo_id} ...")
         self._push_worker = PushWorker(
             str(self._last_copy_dir), repo_id, self.token, private=True)
-        self._push_worker.done.connect(self._on_push_done)
-        self._push_worker.error.connect(self._on_worker_error)
+        self._push_worker.done.connect(
+            self._guarded("推送数据集副本", self._on_push_done, pass_args=True))
+        self._push_worker.error.connect(
+            self._guarded("推送数据集副本", self._on_worker_error, pass_args=True))
         self._push_worker.finished.connect(
             lambda worker=self._push_worker:
             self._on_one_shot_worker_finished("_push_worker", worker))
@@ -2687,8 +2767,10 @@ class MainWindow(QWidget):
         self.status.setText(f"执行 {self.op_combo.currentText()} ...（视频操作较慢）")
         self._op_worker = LerobotOpWorker(spec)
         self._op_worker.log.connect(self.status.setText)
-        self._op_worker.done.connect(self._on_op_done)
-        self._op_worker.error.connect(self._on_worker_error)
+        self._op_worker.done.connect(
+            self._guarded("执行数据集操作", self._on_op_done, pass_args=True))
+        self._op_worker.error.connect(
+            self._guarded("执行数据集操作", self._on_worker_error, pass_args=True))
         self._op_worker.finished.connect(
             lambda worker=self._op_worker:
             self._on_one_shot_worker_finished("_op_worker", worker))
@@ -2729,11 +2811,14 @@ class MainWindow(QWidget):
 
         row = QHBoxLayout()
         self.viewer_start_btn = QPushButton("启动 Viewer")
-        self.viewer_start_btn.clicked.connect(self._viewer_start)
+        self.viewer_start_btn.clicked.connect(
+            self._guarded("启动 Viewer", self._viewer_start))
         self.viewer_stop_btn = QPushButton("停止")
-        self.viewer_stop_btn.clicked.connect(self._viewer_stop)
+        self.viewer_stop_btn.clicked.connect(
+            self._guarded("停止 Viewer", self._viewer_stop))
         self.viewer_home_btn = QPushButton("打开首页")
-        self.viewer_home_btn.clicked.connect(self._viewer_open_home)
+        self.viewer_home_btn.clicked.connect(
+            self._guarded("打开 Viewer 首页", self._viewer_open_home))
         for b in (self.viewer_start_btn, self.viewer_stop_btn, self.viewer_home_btn):
             row.addWidget(b)
         row.addStretch()
@@ -2753,7 +2838,8 @@ class MainWindow(QWidget):
         self._viewer_tick = 0
         self._viewer_count = None
         self.viewer_timer = QTimer(self)
-        self.viewer_timer.timeout.connect(self._refresh_viewer_status)
+        self.viewer_timer.timeout.connect(
+            self._guarded("刷新 Viewer 状态", self._refresh_viewer_status))
         self.viewer_timer.start(2000)
         self._refresh_viewer_status()
         return w
@@ -3270,10 +3356,14 @@ class MainWindow(QWidget):
         self.doctor_progress.setFormat("%p%")
         self.doctor_status.setText("正在启动 Doctor…")
         worker = DoctorWorker(self.viewer, rel, scope, seq)
-        worker.progress.connect(self._on_doctor_progress)
+        worker.progress.connect(
+            self._guarded("刷新 Doctor 进度", self._on_doctor_progress, pass_args=True))
         worker.done.connect(
-            lambda done_seq, key, result, error:
-            self._on_doctor_done(done_seq, key, result, error, cache_key))
+            self._guarded(
+                "渲染 Doctor 结果",
+                lambda done_seq, key, result, error:
+                self._on_doctor_done(done_seq, key, result, error, cache_key),
+                pass_args=True))
         worker.finished.connect(
             lambda worker=worker: self._forget_worker("_doctor_workers", worker))
         self._doctor_workers.append(worker)
@@ -3445,9 +3535,12 @@ class MainWindow(QWidget):
                 "episode_local_quality", "Episode 级质量定位", "local_quality",
                 chk_mod.SKIP, "检查中...", [])])
         self.quality_worker = QualityWorker(seq, dataset, self.token, _CHECKS_CFG)
-        self.quality_worker.progress.connect(self._on_quality_progress)
-        self.quality_worker.done.connect(self._on_quality_done)
-        self.quality_worker.finished.connect(self._on_quality_worker_finished)
+        self.quality_worker.progress.connect(
+            self._guarded("刷新深度检查进度", self._on_quality_progress, pass_args=True))
+        self.quality_worker.done.connect(
+            self._guarded("渲染深度检查结果", self._on_quality_done, pass_args=True))
+        self.quality_worker.finished.connect(
+            self._guarded("结束深度检查", self._on_quality_worker_finished))
         self.quality_worker.start()
 
     def on_quality_cancel(self):
@@ -3632,7 +3725,8 @@ class MainWindow(QWidget):
             _CHECKS_CFG.get("pico_motracker", {}),
             seq,
         )
-        worker.done.connect(self._on_pico_check_done)
+        worker.done.connect(
+            self._guarded("渲染 PICO 检查结果", self._on_pico_check_done, pass_args=True))
         worker.finished.connect(
             lambda worker=worker: self._forget_worker("_pico_workers", worker))
         self._pico_workers.append(worker)
@@ -3792,7 +3886,8 @@ class MainWindow(QWidget):
             return
         self._report_set_note("分析中…（首次约 10–30s）", busy=True)
         w = ReportWorker(self.viewer, rel, seq)
-        w.done.connect(self._on_report_done)
+        w.done.connect(
+            self._guarded("渲染 Viewer 分析", self._on_report_done, pass_args=True))
         w.finished.connect(
             lambda worker=w: self._forget_worker("_report_workers", worker))
         self._report_workers.append(w)
@@ -4409,9 +4504,27 @@ class MainWindow(QWidget):
         if stop_speed and hasattr(self, "speed_timer"):
             self._stop_speed()
         msg = f"{action}失败: {exc}"
-        self.status.setText(msg)
-        if not self._closing:
-            QMessageBox.critical(self, "错误", msg)
+        if hasattr(self, "status"):
+            self.status.setText(msg)
+        if not getattr(self, "_closing", False):
+            try:
+                QMessageBox.critical(self, "错误", msg)
+            except Exception:
+                pass
+
+    def _guarded(self, action, func, *, pass_args=False, stop_speed=True):
+        """Wrap Qt callbacks so Python exceptions do not escape the event loop."""
+        def wrapped(*args, **kwargs):
+            if getattr(self, "_closing", False):
+                return None
+            try:
+                if pass_args:
+                    return func(*args, **kwargs)
+                return func()
+            except Exception as exc:
+                self._handle_ui_exception(action, exc, stop_speed=stop_speed)
+                return None
+        return wrapped
 
     def _on_identity(self, seq, name, has_token, org, count):
         # Only the most recent check may update the label — a slower older worker
@@ -4544,10 +4657,14 @@ class MainWindow(QWidget):
         self.worker = worker
         self._pull_worker = worker
         worker.log.connect(self.status.setText)
-        worker.progress.connect(self._on_progress)
-        worker.done.connect(self._on_pull_done)
-        worker.error.connect(self._on_pull_error)
-        worker.finished.connect(self._on_pull_worker_finished)
+        worker.progress.connect(
+            self._guarded("刷新同步进度", self._on_progress, pass_args=True))
+        worker.done.connect(
+            self._guarded("完成同步全部数据集", self._on_pull_done, pass_args=True))
+        worker.error.connect(
+            self._guarded("同步全部数据集", self._on_pull_error, pass_args=True))
+        worker.finished.connect(
+            self._guarded("结束同步全部数据集", self._on_pull_worker_finished))
         worker.start()
 
     def on_download_selected(self):
@@ -4589,9 +4706,12 @@ class MainWindow(QWidget):
             worker = DownloadOneWorker(repo_id, OUT_DIR, self.token)
             self._download_workers.append(worker)
             worker.log.connect(self.status.setText)
-            worker.done.connect(self._on_download_one_done)
-            worker.error.connect(self._on_download_error)
-            worker.finished.connect(self._on_download_worker_finished)
+            worker.done.connect(
+                self._guarded("完成下载数据集", self._on_download_one_done, pass_args=True))
+            worker.error.connect(
+                self._guarded("下载数据集", self._on_download_error, pass_args=True))
+            worker.finished.connect(
+                self._guarded("结束下载数据集", self._on_download_worker_finished))
             worker.start()
         skipped = len(datasets) - len(pending)
         suffix = f"，跳过已下载/下载中 {skipped} 个" if skipped else ""
@@ -4708,13 +4828,17 @@ class MainWindow(QWidget):
         self.worker = worker
         self._stats_worker = worker
         worker.log.connect(self.status.setText)
-        worker.progress.connect(self._on_progress)
-        worker.done.connect(self._on_stats_done)
+        worker.progress.connect(
+            self._guarded("刷新统计进度", self._on_progress, pass_args=True))
+        worker.done.connect(
+            self._guarded("完成刷新统计", self._on_stats_done, pass_args=True))
         # Keep the busy lock until QThread.run() has actually returned.  The
         # worker emits done just before returning, so unlocking in _on_stats_done
         # allowed a second click to replace a still-running QThread.
-        worker.error.connect(self._on_stats_error)
-        worker.finished.connect(self._on_stats_worker_finished)
+        worker.error.connect(
+            self._guarded("刷新统计", self._on_stats_error, pass_args=True))
+        worker.finished.connect(
+            self._guarded("结束刷新统计", self._on_stats_worker_finished))
         worker.start()
         self._refresh_action_states()
 
@@ -4927,8 +5051,10 @@ class MainWindow(QWidget):
         worker = CheckWorker(org, OUT_DIR, self.token)
         self.worker = worker
         self._check_worker = worker
-        worker.result.connect(self._on_check_result)
-        worker.error.connect(self._on_worker_error)
+        worker.result.connect(
+            self._guarded("显示新增检查结果", self._on_check_result, pass_args=True))
+        worker.error.connect(
+            self._guarded("检查新增", self._on_worker_error, pass_args=True))
         worker.finished.connect(
             lambda worker=worker:
             self._on_one_shot_worker_finished("_check_worker", worker))

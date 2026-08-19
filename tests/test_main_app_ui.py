@@ -208,6 +208,44 @@ class MainWindowUiTests(unittest.TestCase):
         self.assertFalse(win.speed_timer.isActive())
         self.assertIn("测速暂停", win.status.text())
 
+    def test_guarded_slot_reports_exception_without_raising(self):
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        def fail():
+            raise RuntimeError("boom")
+
+        with patch.object(main_app.traceback, "print_exception"), \
+                patch.object(main_app.QMessageBox, "critical") as critical:
+            win._guarded("测试动作", fail)()
+
+        critical.assert_called_once()
+        self.assertIn("测试动作失败: boom", win.status.text())
+
+    def test_startup_snapshot_render_failure_does_not_abort_window(self):
+        report = {
+            "date": "260101",
+            "org": "TacVerse",
+            "datasets": [{"dataset_name": "TacVerse/bad"}],
+        }
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[report]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"), \
+                patch.object(main_app.MainWindow, "_refresh_all",
+                             side_effect=RuntimeError("render failed")), \
+                patch.object(main_app.traceback, "print_exception"), \
+                patch.object(main_app.QMessageBox, "critical") as critical:
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        critical.assert_called_once()
+        self.assertIsNone(win.report)
+
     def test_stats_and_download_actions_can_run_concurrently(self):
         with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
                 patch.object(main_app.dd, "load_history", return_value=[]), \
