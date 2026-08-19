@@ -1106,7 +1106,6 @@ class MainWindow(QWidget):
         self.viewer = vsvc.ViewerService(port=3001)
         self._report_workers = []   # in-flight ReportWorkers
         self._report_seq = 0        # only the latest selection's report renders
-        self._report_cache = {}     # rel_path -> report dict (per session)
         self._pico_workers = []     # in-flight opt-in trajectory scans
         self._pico_seq = 0
         self._pico_cache = {}       # dataset path -> DetectionResult or error tuple
@@ -2761,7 +2760,7 @@ class MainWindow(QWidget):
 
     def _viewer_start(self):
         if not self.viewer.available():
-            msg = f"Viewer 未就绪：请在 {self.viewer.viewer_dir} 执行 bun install"
+            msg = f"Viewer 未就绪：{vsvc.install_hint(self.viewer.viewer_dir)}"
             self.viewer_detail.setText(msg)
             self.status.setText(msg)
             return
@@ -3780,7 +3779,7 @@ class MainWindow(QWidget):
     def _refresh_report(self, d):
         """Fill STATISTICS / FILTERING / ACTION INSIGHTS from the viewer /report
         analysis for the selected dataset. Fetched in a background thread (can
-        take tens of seconds); cached per session; stale selections ignored."""
+        take tens of seconds); stale selections are ignored."""
         if self._closing:
             return
         self._report_seq += 1
@@ -3792,10 +3791,6 @@ class MainWindow(QWidget):
         if not rel:
             self._report_set_note("该数据集不在 Viewer 数据根，暂无分析。")
             return
-        cached = self._report_cache.get(rel)
-        if cached is not None:
-            self._render_report(cached)
-            return
         self._report_set_note("分析中…（首次约 10–30s）", busy=True)
         w = ReportWorker(self.viewer, rel, seq)
         w.done.connect(self._on_report_done)
@@ -3806,8 +3801,6 @@ class MainWindow(QWidget):
 
     def _on_report_done(self, seq, rel, report, err):
         self._report_workers = [w for w in self._report_workers if w.isRunning()]
-        if report is not None:
-            self._report_cache[rel] = report
         if seq != self._report_seq:
             return  # user moved to another dataset; ignore stale result
         if report is None:

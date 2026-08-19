@@ -85,7 +85,7 @@ python3 -m pip install --upgrade pip
 python3 scripts/install_all.py
 ```
 
-`scripts/install_all.py` 会安装 `requirements-full.txt`，初始化 `third_party/lerobot_viewer` 子模块，并执行 `bun install`。使用 `py -3` / `python3` 的形式可以确保依赖安装到实际启动程序的解释器中。
+`scripts/install_all.py` 会安装 `requirements-full.txt`，初始化 `third_party/lerobot_viewer` 子模块，并执行 `bun install`。使用 `py -3` / `python3` 的形式可以确保依赖安装到实际启动程序的解释器中。未安装 Bun 时也可以进入 `third_party/lerobot_viewer` 执行 `npm install --no-package-lock`（需要 Node.js >=20）。
 
 如果当前机器暂时不需要 LeRobot 数据集操作，可改用轻量安装：
 
@@ -118,7 +118,7 @@ sudo apt install -y libxcb-cursor0
 
 ### 4. 单独安装 Viewer
 
-**Viewer：** 需要仓库子模块、[Bun](https://bun.sh/) 和前端依赖。安装 Bun 后，在项目根目录执行：
+**Viewer：** 需要仓库子模块和前端依赖。安装 [Bun](https://bun.sh/) 后，在项目根目录执行：
 
 ```bash
 python scripts/install_viewer.py
@@ -133,7 +133,16 @@ bun install
 cd ../..
 ```
 
-上述 `cd` 和 `bun` 命令在 Windows PowerShell、Ubuntu 与 macOS 中通用。Viewer 未安装时，其他页签仍可正常使用。
+未安装 Bun 时也可以用 npm（需要 Node.js >=20）：
+
+```bash
+git submodule update --init --recursive third_party/lerobot_viewer
+cd third_party/lerobot_viewer
+npm install --no-package-lock
+cd ../..
+```
+
+上述命令在 Windows PowerShell、Ubuntu 与 macOS 中通用。Viewer 未安装时，其他页签仍可正常使用。
 
 ---
 

@@ -52,6 +52,50 @@ def find_bun():
     return next((str(path) for path in candidates if path.is_file()), None)
 
 
+def find_js_runner():
+    """Return a package runner for the viewer, preferring Bun when installed."""
+    bun = find_bun()
+    if bun:
+        return [bun, "run", "dev"], "bun"
+    npm = shutil.which("npm")
+    node_major, _ = node_version()
+    if npm and node_major is not None and node_major >= 20:
+        return [npm, "run", "dev"], "npm"
+    return None, None
+
+
+def node_version():
+    node = shutil.which("node")
+    if not node:
+        return None, None
+    try:
+        out = subprocess.check_output(
+            [node, "--version"], text=True, timeout=3).strip()
+    except Exception:
+        return None, None
+    version = out.lstrip("v")
+    major = version.split(".", 1)[0]
+    return (int(major), version) if major.isdigit() else (None, version)
+
+
+def install_hint(viewer_dir):
+    viewer_dir = Path(viewer_dir)
+    if not (viewer_dir / "package.json").is_file():
+        return (
+            "请先在项目根目录执行 "
+            "git submodule update --init --recursive third_party/lerobot_viewer")
+    if find_bun():
+        return f"请在 {viewer_dir} 执行 bun install"
+    node_major, node_text = node_version()
+    if shutil.which("npm") and node_major is not None and node_major >= 20:
+        return f"请在 {viewer_dir} 执行 npm install --no-package-lock"
+    if shutil.which("npm") and node_text:
+        return (
+            f"当前 Node.js {node_text} 过旧；请安装 Bun，或升级 Node.js >=20 "
+            f"后在 {viewer_dir} 执行 npm install --no-package-lock")
+    return "请先安装 Bun，或安装 Node.js >=20/npm 后再安装 viewer 依赖"
+
+
 def _port_in_use(port, host="127.0.0.1"):
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
         s.settimeout(0.3)
@@ -268,7 +312,7 @@ def _windows_process_table():
 
 
 class ViewerService:
-    """Supervises one `bun run dev` viewer process bound to a dataset root."""
+    """Supervises one viewer dev server process bound to a dataset root."""
 
     def __init__(self, viewer_dir=VIEWER_DIR, port=DEFAULT_PORT):
         self.viewer_dir = Path(viewer_dir)
@@ -327,8 +371,9 @@ class ViewerService:
 
     # --- lifecycle (contract ①②) -----------------------------------------
     def available(self):
-        """viewer directory + installed deps present?"""
-        return (self.viewer_dir / "package.json").is_file() and \
+        """viewer directory, installed deps, and a usable JS runner present?"""
+        cmd, _ = find_js_runner()
+        return bool(cmd) and (self.viewer_dir / "package.json").is_file() and \
                (self.viewer_dir / "node_modules").is_dir()
 
     def _invalidate_info(self):
@@ -507,11 +552,11 @@ class ViewerService:
                 self._last_error = f"无法关闭旧 Viewer（数据根: {old_root}）"
                 return False, self._last_error
         if not self.available():
-            self._last_error = f"Viewer 未就绪（缺 node_modules）: {self.viewer_dir}"
+            self._last_error = f"Viewer 未就绪：{install_hint(self.viewer_dir)}"
             return False, self._last_error
-        bun = find_bun()
-        if not bun:
-            self._last_error = "未找到 Bun，请先安装 Bun"
+        cmd, runner = find_js_runner()
+        if not cmd:
+            self._last_error = "未找到 Bun 或 npm，无法启动 Viewer"
             return False, self._last_error
 
         env = dict(os.environ)
@@ -526,7 +571,7 @@ class ViewerService:
             creationflags |= getattr(subprocess, "CREATE_NO_WINDOW", 0)
         try:
             self.proc = subprocess.Popen(
-                [bun, "run", "dev"],
+                cmd,
                 cwd=str(self.viewer_dir),
                 env=env,
                 stdout=out,
@@ -545,7 +590,7 @@ class ViewerService:
         self._write_state()
 
         if not wait:
-            return True, "启动中…"
+            return True, f"启动中…（{runner}）"
         return self._wait_until_ready(timeout)
 
     def _wait_until_ready(self, timeout):
