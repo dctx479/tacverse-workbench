@@ -1,14 +1,14 @@
 """Manage the vendored xense_lerobot_viewer as a black-box web service.
 
-workbench talks to the viewer ONLY through its three stable contracts, so the
-viewer's source is never modified and stays upgradable from upstream:
+Workbench talks to the viewer ONLY through its three stable contracts, so the
+submodule stays read-only and only acts as a source reference:
 
   ① LOCAL_DATASET_ROOT env  → the shared dataset root the viewer scans
   ② HTTP on PORT            → home `/` and `/_local/<encodedPath>` deep links
   ③ side-effect files       → meta/xense_tags.json, meta/lerobot_annotations.json
 
-This module owns the viewer subprocess lifecycle (start / health / stop) and
-builds deep-link URLs. It is Qt-free so it can be unit-tested and reused.
+This module owns the viewer runtime copy, subprocess lifecycle (start / health /
+stop) and deep-link URLs. It is Qt-free so it can be unit-tested and reused.
 """
 
 import base64
@@ -26,8 +26,18 @@ import urllib.request
 import webbrowser
 from pathlib import Path
 
-VIEWER_DIR = Path(__file__).resolve().parent / "third_party" / "lerobot_viewer"
+ROOT = Path(__file__).resolve().parent
+VIEWER_SOURCE_DIR = ROOT / "third_party" / "lerobot_viewer"
+VIEWER_RUNTIME_DIR = ROOT / "vendor" / "lerobot_viewer_runtime"
 DEFAULT_PORT = 3000
+
+
+def _path_within(path, parent):
+    try:
+        Path(path).resolve().relative_to(Path(parent).resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def encode_dataset_path(rel_path: str) -> str:
@@ -80,10 +90,14 @@ def node_version():
 
 def install_hint(viewer_dir):
     viewer_dir = Path(viewer_dir)
+    if _path_within(viewer_dir, VIEWER_SOURCE_DIR):
+        return (
+            "请执行 python scripts/install_viewer.py 使用 "
+            f"{VIEWER_RUNTIME_DIR}；submodule 仅保留为源码引用。")
     if not (viewer_dir / "package.json").is_file():
         return (
-            "请先在项目根目录执行 "
-            "git submodule update --init --recursive third_party/lerobot_viewer")
+            "请先执行 python scripts/install_viewer.py "
+            "生成运行时 viewer；submodule 仅保留为源码引用。")
     if find_bun():
         return f"请在 {viewer_dir} 执行 bun install"
     node_major, node_text = node_version()
@@ -94,6 +108,31 @@ def install_hint(viewer_dir):
             f"当前 Node.js {node_text} 过旧；请安装 Bun，或升级 Node.js >=20 "
             f"后在 {viewer_dir} 执行 npm install --no-package-lock")
     return "请先安装 Bun，或安装 Node.js >=20/npm 后再安装 viewer 依赖"
+
+
+def prepare_viewer_runtime(source_dir=VIEWER_SOURCE_DIR,
+                           runtime_dir=VIEWER_RUNTIME_DIR):
+    """Materialize a writable viewer runtime copy from the read-only submodule."""
+    source_dir = Path(source_dir)
+    runtime_dir = Path(runtime_dir)
+    if _path_within(runtime_dir, source_dir):
+        raise ValueError(
+            "viewer runtime directory must be outside the viewer submodule")
+    if not (source_dir / "package.json").is_file():
+        raise FileNotFoundError(
+            f"viewer source not found: {source_dir} "
+            "(run git submodule update --init --recursive)")
+    if runtime_dir.exists():
+        shutil.rmtree(runtime_dir)
+    runtime_dir.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(
+        source_dir, runtime_dir,
+        ignore=shutil.ignore_patterns(
+            ".git", ".gitmodules", "node_modules", ".next", "out", "dist",
+            "*.log", "*.tsbuildinfo",
+        ),
+    )
+    return runtime_dir
 
 
 def _port_in_use(port, host="127.0.0.1"):
@@ -314,8 +353,10 @@ def _windows_process_table():
 class ViewerService:
     """Supervises one viewer dev server process bound to a dataset root."""
 
-    def __init__(self, viewer_dir=VIEWER_DIR, port=DEFAULT_PORT):
+    def __init__(self, viewer_dir=VIEWER_RUNTIME_DIR, source_dir=VIEWER_SOURCE_DIR,
+                 port=DEFAULT_PORT):
         self.viewer_dir = Path(viewer_dir)
+        self.source_dir = Path(source_dir)
         self.port = int(port)
         self.root = None
         self.proc = None
@@ -372,6 +413,8 @@ class ViewerService:
     # --- lifecycle (contract ①②) -----------------------------------------
     def available(self):
         """viewer directory, installed deps, and a usable JS runner present?"""
+        if _path_within(self.viewer_dir, self.source_dir):
+            return False
         cmd, _ = find_js_runner()
         return bool(cmd) and (self.viewer_dir / "package.json").is_file() and \
                (self.viewer_dir / "node_modules").is_dir()
