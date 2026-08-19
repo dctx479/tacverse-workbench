@@ -24,6 +24,7 @@ import os
 import shutil
 import sys
 import time
+import traceback
 import zipfile
 from pathlib import Path
 
@@ -403,18 +404,24 @@ def fmt_speed(bytes_per_sec):
 
 def dir_size(path):
     """Total bytes of materialized files under path (skips hf .cache blobs)."""
-    p = Path(path)
-    if not p.exists():
+    if path is None:
+        return 0
+    try:
+        p = Path(path)
+        if not p.exists():
+            return 0
+        files = p.rglob("*")
+    except OSError:
         return 0
     total = 0
-    for f in p.rglob("*"):
-        if ".cache" in f.parts:
-            continue
-        try:
+    try:
+        for f in files:
+            if ".cache" in f.parts:
+                continue
             if f.is_file():
                 total += f.stat().st_size
-        except OSError:
-            pass
+    except OSError:
+        pass
     return total
 
 
@@ -4404,6 +4411,16 @@ class MainWindow(QWidget):
         if worker is not None:
             worker.deleteLater()
 
+    def _handle_ui_exception(self, action, exc, *, stop_speed=True):
+        """Report an exception raised by a main-thread Qt slot without crashing."""
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+        if stop_speed and hasattr(self, "speed_timer"):
+            self._stop_speed()
+        msg = f"{action}失败: {exc}"
+        self.status.setText(msg)
+        if not self._closing:
+            QMessageBox.critical(self, "错误", msg)
+
     def _on_identity(self, seq, name, has_token, org, count):
         # Only the most recent check may update the label — a slower older worker
         # (e.g. the startup one) must not clobber a fresh account-switch result.
@@ -4585,8 +4602,15 @@ class MainWindow(QWidget):
         worker = self.sender()
         if worker is not None:
             worker.local_dir = local_dir
-        self._refresh_table()  # the newly downloaded row now shows 已下载
-        if self._download_workers:
+        refresh_ok = True
+        try:
+            # The newly downloaded row now shows 已下载.  Keep this guarded:
+            # it runs in the GUI thread after a background worker completes.
+            self._refresh_table()
+        except Exception as exc:
+            refresh_ok = False
+            self._handle_ui_exception("下载完成后刷新表格", exc, stop_speed=False)
+        if refresh_ok and self._download_workers:
             self.status.setText(f"下载完成: {local_dir}")
         self._refresh_download_progress()
 
@@ -4806,7 +4830,12 @@ class MainWindow(QWidget):
 
     def _tick_speed(self):
         now = time.monotonic()
-        cur = dir_size(self._watch_dir)
+        try:
+            cur = dir_size(self._watch_dir)
+        except Exception as exc:
+            self.speed_timer.stop()
+            self.status.setText(f"测速暂停: {exc}")
+            return
         elapsed = now - (self._prev_t or now)
         if elapsed > 0:
             self.speed_label.setText(fmt_speed((cur - self._prev_bytes) / elapsed))
@@ -4824,18 +4853,23 @@ class MainWindow(QWidget):
 
     def _on_pull_done(self, report, out_path):
         self._stop_speed()
-        self.report = report
-        self.history = dd.load_history(
-            OUT_DIR, org=report.get("org"))  # new snapshot just written
-        self.hf_changes = dd.load_hf_change_history()
-        self._refresh_all()
-        self._hide_stale_banner()  # data is now live
-        fails = len(report.get("failures", []))
-        msg = f"拉取完成: {report['count']}/{report['requested']} 个数据集"
-        if fails:
-            msg += f"，{fails} 个失败"
-        self.status.setText(
-            msg + (f"  ->  {out_path}" if out_path else ""))
+        try:
+            self.report = report
+            self.history = dd.load_history(
+                OUT_DIR, org=report.get("org"))  # new snapshot just written
+            self.hf_changes = dd.load_hf_change_history()
+            self._refresh_all()
+            self._hide_stale_banner()  # data is now live
+            fails = len(report.get("failures", []))
+            msg = (
+                f"拉取完成: {report.get('count', 0)}/"
+                f"{report.get('requested', 0)} 个数据集")
+            if fails:
+                msg += f"，{fails} 个失败"
+            self.status.setText(
+                msg + (f"  ->  {out_path}" if out_path else ""))
+        except Exception as exc:
+            self._handle_ui_exception("拉取完成后刷新界面", exc, stop_speed=False)
 
     def _on_pull_error(self, msg):
         """Show a pull failure; finished releases the worker/busy lock."""
@@ -4856,25 +4890,31 @@ class MainWindow(QWidget):
             worker.deleteLater()
 
     def _on_stats_done(self, report):
-        self.report = report
-        # Record the day's totals so 趋势 / 今日新增 have a daily baseline. 统计
-        # produces per-dataset detail (from each info.json), so this snapshot is
-        # a full baseline — previously only 拉取 wrote history, which is why days
-        # that were only 统计'd never showed up.
-        hist_note = ""
         try:
-            dd.append_pull(report)
-            self.history = dd.load_history(OUT_DIR)
-            self.hf_changes = dd.load_hf_change_history()
-        except OSError as exc:
-            hist_note = f"（历史未写入: {exc}）"
-        self._refresh_all()
-        self._hide_stale_banner()  # data is now live
-        fails = len(report.get("failures", []))
-        msg = f"统计完成: {report['count']}/{report['requested']} 个数据集，共 {report['total_hours']} 小时"
-        if fails:
-            msg += f"，{fails} 个读取失败"
-        self.status.setText(msg + hist_note)
+            self.report = report
+            # Record the day's totals so 趋势 / 今日新增 have a daily baseline. 统计
+            # produces per-dataset detail (from each info.json), so this snapshot is
+            # a full baseline — previously only 拉取 wrote history, which is why days
+            # that were only 统计'd never showed up.
+            hist_note = ""
+            try:
+                dd.append_pull(report)
+                self.history = dd.load_history(OUT_DIR)
+                self.hf_changes = dd.load_hf_change_history()
+            except Exception as exc:
+                hist_note = f"（历史未写入: {exc}）"
+            self._refresh_all()
+            self._hide_stale_banner()  # data is now live
+            fails = len(report.get("failures", []))
+            msg = (
+                f"统计完成: {report.get('count', 0)}/"
+                f"{report.get('requested', 0)} 个数据集，"
+                f"共 {report.get('total_hours', 0)} 小时")
+            if fails:
+                msg += f"，{fails} 个读取失败"
+            self.status.setText(msg + hist_note)
+        except Exception as exc:
+            self._handle_ui_exception("统计完成后刷新界面", exc, stop_speed=False)
 
     def on_check(self):
         org = self.org_combo.currentText().strip()

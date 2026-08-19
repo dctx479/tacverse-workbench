@@ -136,6 +136,77 @@ class MainWindowUiTests(unittest.TestCase):
         if win._download_message_box is not None:
             win._download_message_box.close()
 
+    def test_download_done_refresh_failure_is_reported_not_raised(self):
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        worker = main_app.DownloadOneWorker(
+            "TacVerse/test-dataset", str(Path(main_app.OUT_DIR).parent), None)
+        win._download_workers = [worker]
+        win._download_started = 1
+        win._download_completed = 0
+
+        with patch.object(win, "sender", return_value=worker), \
+                patch.object(win, "_refresh_table",
+                             side_effect=RuntimeError("render failed")), \
+                patch.object(main_app.traceback, "print_exception"), \
+                patch.object(main_app.QMessageBox, "critical") as critical:
+            win._on_download_one_done(str(Path(main_app.OUT_DIR) / "test-dataset"))
+
+        critical.assert_called_once()
+        self.assertIn("下载完成后刷新表格失败", win.status.text())
+        worker.deleteLater()
+        win._download_workers = []
+
+    def test_stats_done_refresh_failure_is_reported_not_raised(self):
+        report = {
+            "date": "260101",
+            "org": "TacVerse",
+            "count": 1,
+            "requested": 1,
+            "total_hours": 0.1,
+            "datasets": [],
+        }
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        with patch.object(main_app.dd, "append_pull"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(win, "_refresh_all",
+                             side_effect=RuntimeError("render failed")), \
+                patch.object(main_app.traceback, "print_exception"), \
+                patch.object(main_app.QMessageBox, "critical") as critical:
+            win._on_stats_done(report)
+
+        critical.assert_called_once()
+        self.assertIn("统计完成后刷新界面失败", win.status.text())
+
+    def test_speed_tick_failure_pauses_timer_not_process(self):
+        with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                patch.object(main_app.dd, "load_history", return_value=[]), \
+                patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                patch.object(main_app.MainWindow, "_refresh_identity"):
+            win = main_app.MainWindow()
+        self.addCleanup(win.close)
+
+        win._watch_dir = Path(main_app.OUT_DIR)
+        win.speed_timer.start()
+        with patch.object(main_app, "dir_size",
+                          side_effect=RuntimeError("directory disappeared")):
+            win._tick_speed()
+
+        self.assertFalse(win.speed_timer.isActive())
+        self.assertIn("测速暂停", win.status.text())
+
     def test_stats_and_download_actions_can_run_concurrently(self):
         with patch.object(main_app.dd, "migrate_pull_history_to_log"), \
                 patch.object(main_app.dd, "load_history", return_value=[]), \
