@@ -2117,7 +2117,7 @@ class MainWindow(QWidget):
         self.edit_table = QTableWidget(0, len(TABLE_COLS))
         self.edit_table.setHorizontalHeaderLabels([c[0] for c in TABLE_COLS])
         self.edit_table.horizontalHeaderItem(LOCAL_COL).setToolTip(
-            "本地文件表示原始数据是否已下载到 pulls/，已下载的数据集可编辑或在 Viewer 打开。")
+            "本地文件表示原始数据是否已下载到 datasets/<组织名>/，已下载的数据集可编辑或在 Viewer 打开。")
         self.edit_table.setSortingEnabled(True)
         self.edit_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.edit_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -2187,7 +2187,7 @@ class MainWindow(QWidget):
         rv.addWidget(boxA)
 
         # ---- Group B: lerobot 数据集操作 ----
-        boxB = QGroupBox("② 数据集操作（lerobot：删 / 拆 / 并 / 特征）")
+        boxB = QGroupBox("② 数据集操作（lerobot：生成新输出，不改源目录）")
         bv = QVBoxLayout(boxB)
         oprow = QHBoxLayout()
         oprow.addWidget(QLabel("操作:"))
@@ -2214,7 +2214,7 @@ class MainWindow(QWidget):
         self.btn_run_op.clicked.connect(self.on_run_op)
         bv.addWidget(self.btn_run_op)
         self.op_note = QLabel(
-            "输出写到 datasets/<组织名>/，视频操作用 CPU 编码(libx264)较慢，请耐心等待。")
+            "所有操作只写到新的 datasets/<组织名>/<输出名> 目录；若目标已存在会停止，源数据目录不覆盖。")
         self.op_note.setStyleSheet("color:#888; font-size:12px;")
         self.op_note.setWordWrap(True)
         bv.addWidget(self.op_note)
@@ -2246,7 +2246,7 @@ class MainWindow(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(QLabel("要删除的 episode 序号（逗号分隔，如 0,2,5）:"))
+        v.addWidget(QLabel("要从新输出中排除的 episode 序号（源数据不改，逗号分隔，如 0,2,5）:"))
         self.op_del_indices = QLineEdit()
         self.op_del_indices.setPlaceholderText("0,2,5")
         v.addWidget(self.op_del_indices)
@@ -2256,7 +2256,7 @@ class MainWindow(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(QLabel("拆分方式（比例或序号区间）:"))
+        v.addWidget(QLabel("拆分方式（生成 <输出名>_<split>，源数据不改；比例或序号区间）:"))
         self.op_split_spec = QLineEdit()
         self.op_split_spec.setPlaceholderText("train:0.8,val:0.2  或  train:0-4,val:5-6")
         v.addWidget(self.op_split_spec)
@@ -2302,7 +2302,7 @@ class MainWindow(QWidget):
         w = QWidget()
         v = QVBoxLayout(w)
         v.setContentsMargins(0, 0, 0, 0)
-        v.addWidget(QLabel("勾选要删除的特征 / 相机:"))
+        v.addWidget(QLabel("要从新输出中移除的特征 / 相机（源数据不改）:"))
         self.op_rm_list = QListWidget()
         self.op_rm_list.setMaximumHeight(160)
         v.addWidget(self.op_rm_list)
@@ -2996,13 +2996,12 @@ class MainWindow(QWidget):
             f"{fmt_day(top['date'])} · {top['hours']} 小时 · {fmt_value(top['episodes'])} episodes")
 
     def _downloaded_leaves(self):
-        """Leaf names of datasets whose raw files are under datasets/TacVerse/.
+        """Leaf names of datasets whose raw files are under datasets/<org>/.
 
-        A dataset counts as downloaded when datasets/TacVerse/<leaf>/meta/info.json
+        A dataset counts as downloaded when datasets/<org>/<leaf>/meta/info.json
         exists (a full 拉取 writes it; 统计-only never touches datasets/). Only these
         can be opened in the viewer. Scanned once per table refresh."""
-        return {info.parent.parent.name
-                for info in Path(OUT_DIR).glob("*/meta/info.json")}
+        return set(self._downloaded_dataset_dirs())
 
     def _fill_dataset_table(self, table, datasets, deltas, downloaded):
         """Populate a QTableWidget with the dataset detail rows (shared by the
@@ -4563,12 +4562,19 @@ class MainWindow(QWidget):
             self._download_successes = []
             self._download_failures = []
         running = {w.repo_id for w in self._download_workers}
+        downloaded = self._downloaded_leaves()
         pending = [
             d for d in datasets
             if d.get("dataset_name") not in running
+            and (d.get("dataset_name") or "").split("/")[-1] not in downloaded
         ]
         if not pending:
-            QMessageBox.information(self, "提示", "选中的数据集已在下载中。")
+            selected_names = {d.get("dataset_name") for d in datasets}
+            if selected_names and selected_names.issubset(running):
+                msg = "选中的数据集已在下载中。"
+            else:
+                msg = "选中的数据集已下载或正在下载，未重复写入本地数据。"
+            QMessageBox.information(self, "提示", msg)
             return
 
         self._watch_dir = Path(OUT_DIR)
@@ -4587,7 +4593,9 @@ class MainWindow(QWidget):
             worker.error.connect(self._on_download_error)
             worker.finished.connect(self._on_download_worker_finished)
             worker.start()
-        self.status.setText(f"开始下载 {len(pending)} 个数据集 ...")
+        skipped = len(datasets) - len(pending)
+        suffix = f"，跳过已下载/下载中 {skipped} 个" if skipped else ""
+        self.status.setText(f"开始下载 {len(pending)} 个数据集{suffix} ...")
         self._refresh_download_progress()
         self._refresh_action_states()
 

@@ -1,5 +1,6 @@
 import os
 import sys
+import tempfile
 import unittest
 import datetime as dt
 from pathlib import Path
@@ -278,6 +279,71 @@ class MainWindowUiTests(unittest.TestCase):
         for w in win._download_workers:
             w.deleteLater()
         win._download_workers = []
+
+    def test_download_selected_skips_already_downloaded_rows(self):
+        report = {
+            "date": "260101",
+            "org": "TacVerse",
+            "datasets": [
+                {
+                    "dataset_name": "TacVerse/test-a",
+                    "total_episodes": 1,
+                    "total_frames": 1,
+                    "duration_hours": 0.1,
+                    "last_modified": "2026-01-02T00:00:00+00:00",
+                },
+                {
+                    "dataset_name": "TacVerse/test-b",
+                    "total_episodes": 1,
+                    "total_frames": 1,
+                    "duration_hours": 0.1,
+                    "last_modified": "2026-01-01T00:00:00+00:00",
+                },
+            ],
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            out_dir = Path(tmp) / "datasets" / "TacVerse"
+            local_a = out_dir / "legacy-day" / "test-a" / "meta"
+            local_a.mkdir(parents=True)
+            (local_a / "info.json").write_text("{}", encoding="utf-8")
+            with patch.object(main_app, "OUT_DIR", str(out_dir)), \
+                    patch.object(main_app.dd, "migrate_pull_history_to_log"), \
+                    patch.object(main_app.dd, "load_history", return_value=[]), \
+                    patch.object(main_app.dd, "load_hf_change_history", return_value={}), \
+                    patch.object(main_app.MainWindow, "_refresh_identity"):
+                win = main_app.MainWindow()
+                self.addCleanup(win.close)
+                win.report = report
+                win._refresh_table()
+
+                rows_by_name = {}
+                for row in range(win.table.rowCount()):
+                    item = win.table.item(row, 0)
+                    data = item.data(Qt.UserRole) if item else {}
+                    rows_by_name[data.get("dataset_name")] = row
+                self.assertEqual(
+                    "✅ 已下载",
+                    win.table.item(rows_by_name["TacVerse/test-a"], main_app.LOCAL_COL).text(),
+                )
+
+                selection = win.table.fixed.selectionModel()
+                selection.clearSelection()
+                for row in rows_by_name.values():
+                    index = win.table.fixed.model().index(row, 0)
+                    selection.select(
+                        index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
+                win.table._sync_selection(win.table.fixed)
+
+                with patch.object(main_app.DownloadOneWorker, "start") as start:
+                    win.on_download_selected()
+
+                start.assert_called_once()
+                self.assertEqual(1, len(win._download_workers))
+                self.assertEqual("TacVerse/test-b", win._download_workers[0].repo_id)
+                self.assertIn("跳过已下载/下载中 1 个", win.status.text())
+                for w in win._download_workers:
+                    w.deleteLater()
+                win._download_workers = []
 
     def test_trend_axis_labels_are_adaptive(self):
         report = {
